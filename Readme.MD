@@ -1,5 +1,7 @@
 # 🤖 Autonomous AI Software Engineer
 
+![tests](https://github.com/shubhampandit1836-glitch/ai-software-engineer/actions/workflows/tests.yml/badge.svg)
+
 An autonomous coding agent that **plans, writes, security-scans, executes, and debugs** Python programs — with layered guardrails, a bounded self-repair loop, and a Claude-style streaming UI.
 
 🎥 **[Watch the 60-second demo](YOUR_VIDEO_LINK)**
