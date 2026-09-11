@@ -1,0 +1,9 @@
+/* WHY: These inject Tailwind's core styles into your app */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* WHY: Sets a global dark background and monospace font for that "IDE" feel */
+body {
+  @apply bg-gray-950 text-gray-100 font-mono antialiased;
+}

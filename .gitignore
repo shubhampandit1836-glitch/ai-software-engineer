@@ -1,0 +1,23 @@
+# Environment variables and secrets
+.env
+backend/.env
+*.env
+
+# Python cache & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Node & frontend dependencies
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# IDE files
+.vscode/
+.idea/
