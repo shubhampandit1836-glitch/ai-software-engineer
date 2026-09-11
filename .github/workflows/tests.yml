@@ -17,35 +17,23 @@ jobs:
         working-directory: backend
 
     steps:
-      # WHY: checkout@v4 pins the action version - same discipline as
-        # pinning pip versions. v4 is the current stable major.
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # WHY: cache the uv-managed venv keyed on the lockfile. Cuts CI from
-      # ~2 min to ~30s on subsequent runs - deps only reinstall when
-      # requirements change.
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: backend/.venv
-          key: venv-${{ runner.os }}-${{ hashFiles('backend/requirements.txt') }}-${{ hashFiles('backend/requirements-dev.txt') }}
-
-      # WHY: pip here instead of uv - uv isn't preinstalled on GitHub
-      # runners, and pip is always present. Installing uv adds more
-      # moving parts than it removes for a single job.
+      # WHY: pip (not uv) - pip is preinstalled on GitHub runners.
+      # We install into the system Python, so there is no venv to cache.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
       # WHY: DUMMY SECRETS. Importing app modules constructs LLM clients
-      # at import time - they need env vars to EXIST. But our unit tests
-      # never call any API, so a fake key passes construction and is
-      # never validated. Real keys NEVER go in workflow files.
+      # at import time - env vars must EXIST. Unit tests never call any
+      # API, so a fake key passes construction and is never validated.
+      # Real keys NEVER go in workflow files.
       - name: Set dummy env vars
         run: echo "GROQ_API_KEY=gci-dummy-key-for-import-only" >> $GITHUB_ENV
 
