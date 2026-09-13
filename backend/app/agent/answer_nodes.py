@@ -32,7 +32,7 @@ async def direct_answer_node(state: AgentState) -> Dict[str, Any]:
         SystemMessage(content=system_prompt),
         HumanMessage(content=task),
     ]
-    response = await invoke_with_retry(llm_fast, messages)
+    response = await invoke_with_retry(messages, tier="fast")
     content = response.content
     if not isinstance(content, str):
         content = "\n".join(str(item) for item in content)
@@ -72,7 +72,7 @@ it works. Do NOT include any code. Do NOT include the program output."""
         SystemMessage(content=system_prompt),
         HumanMessage(content="Write the summary."),
     ]
-    response = await invoke_with_retry(llm_fast, messages)
+    response = await invoke_with_retry(messages, tier="fast")
     explanation = response.content
     if not isinstance(explanation, str):
         explanation = "\n".join(str(item) for item in explanation)
@@ -88,9 +88,9 @@ it works. Do NOT include any code. Do NOT include the program output."""
 async def failure_answer_node(state: AgentState) -> Dict[str, Any]:
     """Graceful exit when the agent cannot fix the code after 3 review attempts.
 
-    WHY: Deterministic template, zero LLM calls - we are likely rate-limited
-    or facing a genuinely hard problem, so burning more tokens helps no one.
-    The user still gets an honest, structured answer with the last error attached.
+    WHY file-mode: v3's coder always sets current_code to "" (legacy v2
+    field). The old template rendered an EMPTY code block. The real
+    project lives in state['files'] - render the tree plus a preview.
     """
     task = state.get("task_description", "")
     last_error = (
@@ -99,20 +99,31 @@ async def failure_answer_node(state: AgentState) -> Dict[str, Any]:
         or "Unknown error"
     )
     attempts = state.get("review_attempts", 0)
-    code = state.get("current_code", "")
-
-    # WHY: Fence built from a char code, not literal triple backticks -
-    # keeps this file copy-paste-proof.
+    files = state.get("files") or {}
     fence = chr(96) * 3
+
+    if files:
+        tree = "\n".join(f"- {p}" for p in sorted(files))
+        preview = "(showing up to 2 files, first 30 lines each)\n\n"
+        for path in sorted(files)[:2]:
+            content = "\n".join(files[path].split("\n")[:30])
+            # WHY pure-bold filename alone on its line directly above the
+            # fence: the renderer attaches filenames only from PURE bold
+            # lines - the old '(first 30 lines)' inline suffix defeated
+            # detection and every block fell back to the main.py label.
+            preview += f"**{path}**\n{fence}python\n{content}\n{fence}\n\n"
+    else:
+        tree = "(no files were created)"
+        preview = ""
 
     final_answer = (
         f"I attempted to build this program but could not get it passing all "
         f"checks after {attempts} debug attempts.\n\n"
         f"**Task:** {task}\n\n"
+        f"**Files created:**\n{tree}\n\n"
         f"**Last failure:**\n{fence}\n{last_error}\n{fence}\n\n"
-        f"**Best attempt so far:**\n{fence}python\n{code}\n{fence}\n\n"
-        f"Tip: try rephrasing the task more simply, or break it into a "
-        f"smaller problem."
+        f"{preview}"
+        f"Tip: try rephrasing the task more simply, or break it into a smaller problem."
     )
 
     return {"final_answer": final_answer, "status": "failed_final"}

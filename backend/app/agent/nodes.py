@@ -40,13 +40,28 @@ def _extract_code(content: str) -> str:
 
 
 def _render_repo(files: Dict[str, str]) -> str:
-    """Renders the current file tree for prompts (the repo map)."""
+    """Renders the full repository - names AND contents - for the coder.
+
+    WHY contents, not just names: the old name-only map meant each coding
+    step REGENERATED files blind, from the task description alone. The
+    reviewer's fixes from earlier steps lived in state['files'] but were
+    invisible to the coder - so each new step could re-break what review
+    had already repaired (observed in the milestone trace: every step's
+    first test failed). Seeing real contents turns each step into an
+    incremental modification instead of a fresh dice roll.
+    """
     if not files:
         return "(no files yet)"
-    lines = ["File tree:"]
+    parts = []
     for path in sorted(files.keys()):
-        lines.append(f"  - {path}")
-    return "\n".join(lines)
+        content = files[path]
+        lines = content.split("\n")
+        # WHY bounded: prompt hygiene. Our 80-line file cap makes this
+        # cheap, but the bound guarantees it stays cheap if caps change.
+        if len(lines) > 90:
+            content = "\n".join(lines[:90]) + "\n... (truncated)"
+        parts.append(f"--- {path} ---\n{content}")
+    return "\n\n".join(parts)
 
 def _strip_wrapping_fences(lines: list[str]) -> list[str]:
     """Removes markdown fences the LLM wraps around file CONTENT.
@@ -124,7 +139,7 @@ Return ONLY a numbered list. Do not write code yet."""
         SystemMessage(content=system_prompt),
         HumanMessage(content=f"Task: {task}"),
     ]
-    response = await invoke_with_retry(llm_smart, messages)
+    response = await invoke_with_retry(messages, tier="smart")
 
     content = _clean(_to_text(response.content))
 
@@ -173,20 +188,30 @@ THE FULL PLAN:
 You are working on STEP {current_idx + 1}:
 {current_step}
 
-CURRENT REPOSITORY:
+CURRENT REPOSITORY (real contents of files built so far):
 {_render_repo(files)}
 
 RULES (all mandatory):
-1. Output EVERY file you create or modify in this step, COMPLETE, using
+1. Files listed in the repository above already exist and have passed
+   tests. MODIFY them minimally based on their actual contents - do NOT
+   rewrite working code from scratch, and do NOT change behavior earlier
+   steps already verified.
+2. Output EVERY file you create or modify in this step, COMPLETE, using
    this exact format (nothing outside it):
 FILE: path/name.py
 <complete file contents>
 ENDFILE
-2. Repeat the FILE/ENDFILE block for each file in this step.
-3. NEVER output diffs or fragments - always the complete file.
-4. All source files must include a main entry or be importable modules.
-5. Test files go in tests/ and use pytest (functions named test_*).
-6. Stay under 60 lines per file.
+3. Repeat the FILE/ENDFILE block for each file in this step.
+4. NEVER output diffs or fragments - always the complete file.
+5. All source files must be importable modules. For web frameworks
+   (FastAPI/Flask), do NOT include uvicorn.run or any server-startup
+   code - tests use TestClient, which needs no running server, and a
+   blocking server start would hang the sandbox.
+6. Test files go in tests/ and use pytest (functions named test_*).
+   Tests MUST be independent: never rely on state from other tests - reset
+   shared globals in a fixture, and capture ids from responses instead of
+   hardcoding them.
+7. Stay under 80 lines per file.
 
 Output the FILE blocks now."""
 
@@ -194,7 +219,7 @@ Output the FILE blocks now."""
         SystemMessage(content=system_prompt),
         HumanMessage(content="Write the files for this step."),
     ]
-    response = await invoke_with_retry(llm_smart, messages)
+    response = await invoke_with_retry(messages, tier="smart")
 
     raw = _clean(_to_text(response.content))
     new_files = _parse_file_operations(raw)
@@ -305,7 +330,13 @@ async def tester_node(state: AgentState) -> Dict[str, Any]:
                 "execution_result": None,
                 "status": "testing_failed",
             }
-        command = "python " + mains[0]
+        # WHY: prefer conventional entry points - dict order is arbitrary,
+        # and running 'models.py' as the smoke test when a main.py exists
+        # tests the wrong thing
+        entry = next(
+            (p for p in ("main.py", "app.py") if p in files), mains[0]
+        )
+        command = "python " + entry
 
     # WHY: ainvoke, not invoke - a sync .invoke inside an async node BLOCKS
     # the event loop. pip install can run 20-30s; that would freeze every
@@ -352,19 +383,15 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
     # NOT in state and the reviewer must REWRITE it, not patch it.
     repo_listing = _render_repo(files)
 
-    # Give the reviewer the actual content of files mentioned in the error
-    # (bounded: first 3 files named in the traceback, max 40 lines each)
-    import re as _re
-    mentioned = []
-    for path in files.keys():
-        if path in problem:
-            mentioned.append(path)
-    mentioned = mentioned[:3]
+    # WHY full contents, not previews: the old 40-line/mentioned-files
+    # logic starved the reviewer TWICE in the milestone failure - the
+    # traceback only names the TEST file (so app.py was never shown at
+    # all), and the failing test sat at line 41, one line past the
+    # preview window. Generated projects are small (<=80 lines/file,
+    # few files) so full context is cheap and eliminates both blind spots.
     file_contents = ""
-    for path in mentioned:
-        content = files.get(path, "")
-        trimmed = "\n".join(content.split("\n")[:40])
-        file_contents += f"\n--- {path} (first 40 lines) ---\n{trimmed}\n"
+    for path in sorted(files.keys()):
+        file_contents += f"\n--- {path} ---\n{files[path]}\n"
 
     system_prompt = f"""You are an expert Python debugger.
 The overall goal of this project is:
@@ -380,6 +407,10 @@ FAILURE REPORT:
 {file_contents}
 
 RULES:
+0. First state the root cause in ONE line starting with 'ROOT CAUSE:'.
+   Check for these common culprits: state leaking between tests (globals
+   not reset by fixtures), tests hardcoding ids instead of using returned
+   values, wrong status codes, missing imports.
 1. Output corrected files in this exact format, COMPLETE (no diffs):
 FILE: path/name.py
 <complete corrected file contents>
@@ -387,16 +418,18 @@ ENDFILE
 2. Only output files that need changing.
 3. If the failure is a SECURITY VIOLATION, replace the dangerous operation
    with a safe alternative or remove it.
-4. Keep all tests in tests/ passing.
-5. Stay under 60 lines per file.
+4. Keep all tests in tests/ passing. Tests must be independent: never rely
+   on state from a previous test - reset shared globals in fixtures and
+   capture ids from responses instead of hardcoding them.
+5. Stay under 80 lines per file.
 
-Output the FILE blocks now."""
+First the ROOT CAUSE line, then the FILE blocks."""
 
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content="Fix the project."),
     ]
-    response = await invoke_with_retry(llm_smart, messages)
+    response = await invoke_with_retry(messages, tier="smart")
 
     raw = _clean(_to_text(response.content))
     fixed_files = _parse_file_operations(raw)

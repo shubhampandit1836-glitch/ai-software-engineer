@@ -105,7 +105,7 @@ Respond with ONLY the intent label. No explanations, no markdown, no punctuation
         HumanMessage(content=task),
     ]
 
-    response = await invoke_with_retry(llm_fast, messages)
+    response = await invoke_with_retry(messages, tier="fast")
     content = response.content
     if not isinstance(content, str):
         content = "\n".join(str(item) for item in content)

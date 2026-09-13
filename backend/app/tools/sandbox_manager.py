@@ -39,7 +39,10 @@ def get_sandbox() -> Sandbox:
         api_key = os.getenv("E2B_API_KEY")
         if not api_key:
             raise RuntimeError("E2B_API_KEY not found in environment variables.")
-        _sandbox = Sandbox(api_key=api_key)  # type: ignore[call-arg]
+                # WHY timeout=900: E2B's default sandbox timeout (~5 min) would kill
+        # multi-file runs mid-flight - a milestone run (scaffold + pip
+        # install + pytest cycles) legitimately takes 3-8 minutes.
+        _sandbox = Sandbox(api_key=api_key, timeout=900)  # type: ignore[call-arg]
         _created_at = time.monotonic()
     return _sandbox
 

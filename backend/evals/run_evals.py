@@ -33,6 +33,13 @@ CODING_CASES: List[str] = [
     "program to add two numbers",
 ]
 
+# WHY: the v3 crucible - a MULTI-FILE project with dependencies and tests.
+# This is the case a chatbot cannot demo: files created, deps installed,
+# pytest runs in the sandbox, the agent iterates until tests pass.
+MILESTONE_CASES: List[str] = [
+    "build a FastAPI todo API with endpoints to list, add, and delete todos, with pytest tests using TestClient",
+]
+
 
 # ---------- Runners and scorers ----------
 
@@ -97,6 +104,18 @@ def score_coding(r: Dict[str, Any]) -> tuple[bool, str]:
     return True, "code + verified output"
 
 
+def score_milestone(r: Dict[str, Any]) -> tuple[bool, str]:
+    """Milestone scorer: everything coding requires, PLUS multi-file proof."""
+    ok, detail = score_coding(r)
+    if not ok:
+        return ok, detail
+    # WHY: the whole point of v3 - the answer must contain a tests/ file.
+    # A single-file answer means the agent dodged the multi-file crucible.
+    if "tests/" not in r["final_answer"]:
+        return False, "single-file answer - milestone requires tests/"
+    return True, "multi-file project + passing tests"
+
+
 # ---------- Suite orchestration ----------
 
 async def run_category(
@@ -149,26 +168,40 @@ async def main() -> None:
         action="store_true",
         help="Skip coding cases (no sandbox usage, minimal tokens)",
     )
+    parser.add_argument(
+        "--milestone",
+        action="store_true",
+        help="Run ONLY the v3 multi-file milestone case (FastAPI + tests)",
+    )
     args = parser.parse_args()
 
     print("AI SOFTWARE ENGINEER - EVAL SUITE")
-    print(f"Mode: {'fast (no coding cases)' if args.fast else 'full'}")
 
     results: List[Dict[str, Any]] = []
     categories: Dict[str, Dict[str, int]] = {}
 
-    # WHY: cheapest first (guardrail costs ZERO tokens), expensive last.
-    categories["guardrail"] = await run_category(
-        "guardrail", GUARDRAIL_CASES, score_guardrail, results, delay_s=1.0
-    )
-    categories["general"] = await run_category(
-        "general", GENERAL_CASES, score_general, results, delay_s=3.0
-    )
-
-    if not args.fast:
-        categories["coding"] = await run_category(
-            "coding", CODING_CASES, score_coding, results, delay_s=15.0
+    if args.milestone:
+        print("Mode: milestone (v3 multi-file crucible)")
+        # WHY: the milestone is long (pip install + multiple steps + pytest).
+        # Running it alone keeps the signal clean - one case, one verdict.
+        categories["milestone"] = await run_category(
+            "milestone", MILESTONE_CASES, score_milestone, results, delay_s=5.0
         )
+    else:
+        print(f"Mode: {'fast (no coding cases)' if args.fast else 'full'}")
+
+        # WHY: cheapest first (guardrail costs ZERO tokens), expensive last.
+        categories["guardrail"] = await run_category(
+            "guardrail", GUARDRAIL_CASES, score_guardrail, results, delay_s=1.0
+        )
+        categories["general"] = await run_category(
+            "general", GENERAL_CASES, score_general, results, delay_s=3.0
+        )
+
+        if not args.fast:
+            categories["coding"] = await run_category(
+                "coding", CODING_CASES, score_coding, results, delay_s=15.0
+            )
 
     # ---------- Scorecard ----------
     total = sum(c["total"] for c in categories.values())
@@ -186,7 +219,7 @@ async def main() -> None:
     # link the file in your repo - reviewers can verify your claims.
     report = {
         "timestamp": datetime.now().isoformat(),
-        "mode": "fast" if args.fast else "full",
+        "mode": "milestone" if args.milestone else ("fast" if args.fast else "full"),
         "summary": {"total": total, "passed": passed, "score_pct": score_pct},
         "categories": categories,
         "cases": results,

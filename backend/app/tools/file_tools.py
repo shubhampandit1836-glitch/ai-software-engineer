@@ -139,20 +139,26 @@ def run_command(command: str) -> str:
     if rejection:
         return rejection
 
+    # WHY per-command timeout: pip install on a fresh sandbox legitimately
+    # takes 30-120s - a flat 60s cap can kill installs mid-flight. Test and
+    # run commands stay at 60s so a hung server-start can never stall the run.
+    is_install = command.startswith(("pip ", "python -m pip"))
+    cmd_timeout = 300 if is_install else 60
+
     try:
         sb = get_sandbox()
         try:
-            result = sb.commands.run(command)  # type: ignore[union-attr]
+            result = sb.commands.run(command, timeout=cmd_timeout)  # type: ignore[union-attr]
             stdout = result.stdout or ""
             stderr = result.stderr or ""
             exit_code = result.exit_code
         except Exception as cmd_err:
-            # WHY: the e2b SDK (v1.x) RAISES when a command exits non-zero
-            # instead of returning a result. The message carries the exit
-            # code and stderr - we parse it so the caller gets the SAME
-            # 'EXIT N' contract either way. Without this, a plain code bug
-            # (SyntaxError, exit 1) was mislabeled 'Sandbox command error'
-            # -> misrouted to infrastructure_error -> no reviewer attempt.
+            # WHY: e2b v1.x RAISES on non-zero exit, and the exception
+            # OBJECT carries the real stdout/stderr - str(e) alone holds
+            # only the exit-code line. The milestone failure arrived as an
+            # 'empty' error because pytest's failure output lives in
+            # STDOUT, which we dropped - leaving the reviewer blind.
+            # Extract every structured attribute, defensively.
             msg = str(cmd_err)
             exit_code = 1
             if "exited with code" in msg:
@@ -160,8 +166,15 @@ def run_command(command: str) -> str:
                     exit_code = int(msg.split("exited with code")[1].split()[0])
                 except (ValueError, IndexError):
                     exit_code = 1
-            stdout = ""
-            stderr = msg
+            stdout = getattr(cmd_err, "stdout", None) or ""
+            stderr = getattr(cmd_err, "stderr", None) or msg
+            # WHY: some SDK versions attach list-typed outputs
+            if isinstance(stdout, list):
+                stdout = "\n".join(str(x) for x in stdout)
+            if isinstance(stderr, list):
+                stderr = "\n".join(str(x) for x in stderr)
+            if not stdout.strip() and not stderr.strip():
+                stderr = msg + "\n(no output captured - process may have been killed)"
 
         MAX_OUTPUT = 8000
         output = (stdout + ("\n--- stderr ---\n" + stderr if stderr else "")).strip()
@@ -173,6 +186,5 @@ def run_command(command: str) -> str:
         return f"EXIT {exit_code} (FAILED)\n{output}"
     except Exception as e:
         # WHY: only TRUE infrastructure failures (connection dead, sandbox
-        # gone) land here now. Command failures are exit codes, not
-        # exceptions - the distinction routes code bugs to the reviewer.
+        # gone) land here. Command failures are exit codes, not exceptions.
         return f"Sandbox command error: {str(e)}"
