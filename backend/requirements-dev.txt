@@ -7,7 +7,7 @@ langchain-openai==0.2.10
 e2b-code-interpreter==1.0.3
 python-dotenv==1.0.1
 pydantic==2.10.2
-langgraph-checkpoint==<from pip list>
-langgraph-checkpoint-postgres==<from pip list>
-psycopg[binary]==<from pip list>
-psycopg-pool==<from pip list>
+langgraph-checkpoint==2.1.2
+langgraph-checkpoint-postgres==2.0.25
+psycopg[binary]==3.3.5
+psycopg-pool==3.3.1
