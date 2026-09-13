@@ -1,9 +1,182 @@
-/* WHY: These inject Tailwind's core styles into your app */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* WHY: Sets a global dark background and monospace font for that "IDE" feel */
-body {
-  @apply bg-gray-950 text-gray-100 font-mono antialiased;
+/* ============ DESIGN TOKENS ============ */
+:root {
+  --font-serif: "Times New Roman", Times, serif;   /* requested typeface */
+  --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --bg-0: #0b0a1a;
+  --bg-1: #141131;
+  --ink: #ece9ff;
+  --ink-dim: #a8a3cf;
+  --brand-1: #818cf8;   /* indigo  */
+  --brand-2: #c084fc;   /* purple  */
+  --brand-3: #f472b6;   /* pink    */
 }
+
+html, body, #root { height: 100%; }
+
+body {
+  font-family: var(--font-serif);
+  color: var(--ink);
+  background:
+    radial-gradient(1100px 550px at 85% -10%, rgba(192,132,252,.16), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(244,114,182,.11), transparent 60%),
+    radial-gradient(700px 400px at 50% 60%, rgba(129,140,248,.08), transparent 60%),
+    linear-gradient(180deg, var(--bg-0), var(--bg-1));
+  background-attachment: fixed;
+}
+
+/* WHY mono override: code must NEVER render in Times New Roman - the
+   serif destroys alignment and readability of code blocks. */
+code, pre { font-family: var(--font-mono); }
+
+/* ============ LAYOUT ============ */
+.app-shell { display: flex; height: 100vh; overflow: hidden; }
+
+.app-header, .app-footer {
+  background: rgba(20, 17, 49, 0.55);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.app-header {
+  display: flex; align-items: center; gap: .75rem;
+  padding: .75rem 1.5rem; border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.app-footer { padding: 1rem 1.5rem; border-top: 1px solid rgba(255,255,255,.08); }
+
+.header-title {
+  font-size: 1.05rem; font-weight: 700;
+  background: linear-gradient(90deg, var(--brand-1), var(--brand-2), var(--brand-3));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw;
+}
+.header-sub { font-size: .68rem; color: var(--ink-dim); }
+
+.hamburger {
+  font-size: 1.2rem; color: var(--ink-dim);
+  background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12);
+  border-radius: .5rem; padding: .2rem .6rem; cursor: pointer;
+}
+
+/* ============ SIDEBAR ============ */
+.sidebar {
+  width: 17rem; flex-shrink: 0; display: flex; flex-direction: column;
+  border-right: 1px solid rgba(255,255,255,.08);
+  background: rgba(11, 10, 26, 0.72);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  z-index: 40;
+}
+.brand-title {
+  font-size: 1.05rem; font-weight: 700;
+  background: linear-gradient(90deg, var(--brand-1), var(--brand-2), var(--brand-3));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.brand-sub { font-size: .66rem; color: var(--ink-dim); margin-top: 2px; }
+
+.thread-item {
+  display: flex; align-items: center; gap: .25rem;
+  padding: .5rem .75rem; border-radius: .6rem; font-size: .85rem;
+  color: var(--ink-dim); border: 1px solid transparent;
+  transition: all .18s ease;
+}
+.thread-item:hover { background: rgba(129,140,248,.08); color: var(--ink); }
+.thread-item-active {
+  background: linear-gradient(135deg, rgba(129,140,248,.18), rgba(192,132,252,.14));
+  border-color: rgba(129,140,248,.35); color: var(--ink);
+}
+.thread-item .thread-delete {
+  opacity: 0; font-size: .8rem; padding: .15rem .3rem; border-radius: .4rem;
+  transition: all .15s ease; cursor: pointer;
+}
+.thread-item:hover .thread-delete { opacity: .55; }
+.thread-delete:hover { opacity: 1 !important; background: rgba(244,63,94,.25); }
+
+/* WHY drawer pattern: below md the sidebar slides over the chat instead
+   of squeezing it - the chat area keeps usable width on phones. */
+@media (max-width: 767px) {
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0;
+    transform: translateX(-100%); transition: transform .25s ease;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+  }
+  .sidebar-open { transform: translateX(0); }
+}
+
+/* ============ BUTTONS ============ */
+.btn-brand {
+  font-weight: 700; font-size: .9rem; color: #fff; cursor: pointer;
+  background: linear-gradient(135deg, var(--brand-1), var(--brand-2) 55%, var(--brand-3));
+  padding: .6rem 1rem; border-radius: .7rem;
+  box-shadow: 0 4px 20px rgba(139,92,246,.35);
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.btn-brand:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 26px rgba(139,92,246,.5); }
+.btn-brand:disabled { opacity: .45; cursor: not-allowed; }
+
+.btn-danger {
+  background: linear-gradient(135deg, #f43f5e, #e11d48); color: #fff;
+  font-weight: 600; font-size: .85rem; padding: .5rem 1.1rem;
+  border-radius: .6rem; cursor: pointer;
+}
+.btn-ghost {
+  background: rgba(255,255,255,.07); color: var(--ink);
+  border: 1px solid rgba(255,255,255,.14);
+  font-size: .85rem; padding: .5rem 1.1rem; border-radius: .6rem; cursor: pointer;
+  transition: all .15s ease;
+}
+.btn-ghost:hover { border-color: var(--brand-2); }
+
+/* ============ CHAT ============ */
+.glass-card {
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 1rem; padding: 1rem;
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+}
+.bubble-user {
+  max-width: 80%;
+  background: linear-gradient(135deg, rgba(129,140,248,.35), rgba(192,132,252,.3));
+  border: 1px solid rgba(129,140,248,.45);
+  border-radius: 1rem 1rem .25rem 1rem;
+  padding: .55rem 1rem; font-size: .95rem;
+}
+.bubble-agent {
+  background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
+  border-radius: 1rem 1rem 1rem .25rem; padding: .6rem 1rem;
+  font-size: .9rem; color: var(--ink-dim);
+}
+.input-chat {
+  flex: 1; background: rgba(255,255,255,.06);
+  border: 1px solid rgba(255,255,255,.12); border-radius: .75rem;
+  padding: .75rem 1rem; color: var(--ink); font-size: .95rem;
+  transition: border-color .2s ease, box-shadow .2s ease;
+}
+.input-chat:focus { outline: none; border-color: var(--brand-2); box-shadow: 0 0 0 3px rgba(192,132,252,.2); }
+.input-chat::placeholder { color: rgba(168,163,207,.55); }
+.input-chat:disabled { opacity: .5; }
+
+/* ============ MODAL ============ */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(5,4,15,.7); backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  animation: fadeIn .15s ease;
+}
+.modal-card {
+  width: min(92vw, 26rem);
+  background: linear-gradient(160deg, rgba(32,28,66,.96), rgba(18,16,43,.98));
+  border: 1px solid rgba(255,255,255,.12); border-radius: 1rem;
+  padding: 1.5rem; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  animation: popIn .18s ease;
+}
+
+/* ============ MOTION & SCROLL ============ */
+.fade-in { animation: fadeIn .25s ease; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes popIn { from { opacity: 0; transform: scale(.95); } to { opacity: 1; transform: scale(1); } }
+
+.thin-scroll::-webkit-scrollbar { width: 8px; }
+.thin-scroll::-webkit-scrollbar-thumb { background: rgba(129,140,248,.25); border-radius: 4px; }
+.thin-scroll::-webkit-scrollbar-track { background: transparent; }

@@ -28,6 +28,14 @@ def _clean(text: str) -> str:
         text = text[:start] + text[end:]
     return text.strip()
 
+def _strip_tool_calls(text: str) -> str:
+    """Removes <tool_call>...</tool_call> blocks some models emit when
+    trying to 'act' instead of writing files (observed corrupting main.py)."""
+    while "<tool_call>" in text and "</tool_call>" in text:
+        start = text.find("<tool_call>")
+        end = text.find("</tool_call>") + len("</tool_call>")
+        text = text[:start] + text[end:]
+    return text
 
 def _extract_code(content: str) -> str:
     """Pulls pure Python out of a (possibly markdown-wrapped) LLM response."""
@@ -230,7 +238,7 @@ Output the FILE blocks now."""
     ]
     response = await invoke_with_retry(messages, tier="smart")
 
-    raw = _clean(_to_text(response.content))
+    raw = _strip_tool_calls(_clean(_to_text(response.content)))
     new_files = _parse_file_operations(raw)
 
     # WHY: if parsing produced nothing (model ignored the format), fall
@@ -440,7 +448,7 @@ First the ROOT CAUSE line, then the FILE blocks."""
     ]
     response = await invoke_with_retry(messages, tier="smart")
 
-    raw = _clean(_to_text(response.content))
+    raw = _strip_tool_calls(_clean(_to_text(response.content)))
     fixed_files = _parse_file_operations(raw)
 
     write_results = []

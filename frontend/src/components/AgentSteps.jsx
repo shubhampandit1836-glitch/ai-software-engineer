@@ -22,9 +22,10 @@ export default function AgentSteps({ steps, isRunning, currentNode, durationMs }
 
         {done ? (
           <span>
-  <span className="text-green-500">✓</span> Completed in {seconds}s · {steps.length}{" "}
-  {steps.length === 1 ? "step" : "steps"}
-</span>
+            <span className="text-emerald-400">✓</span>
+            {durationMs > 0 ? ` Completed in ${seconds}s · ` : " Completed · "}
+            {steps.length} {steps.length === 1 ? "step" : "steps"}
+          </span>
         ) : (
           <span className="animate-pulse">
             {getPhase(currentNode).icon} {getPhase(currentNode).label}... (thinking)
