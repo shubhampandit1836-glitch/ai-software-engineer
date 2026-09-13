@@ -35,7 +35,7 @@ def _state(**overrides) -> AgentState:
 
 def test_initial_state_has_all_13_fields():
     s = get_initial_state("hello")
-    assert len(s) == 13
+    assert len(s) == 14
     assert s["intent"] == "unknown"
     assert s["review_attempts"] == 0
     assert s["final_answer"] is None

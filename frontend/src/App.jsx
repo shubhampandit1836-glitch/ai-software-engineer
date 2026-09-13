@@ -66,10 +66,9 @@ export default function App() {
               );
             }
 
-            // Agent turn
+                       // Agent turn
             return (
               <div key={i} className="flex flex-col gap-2 items-start">
-                {/* Collapsible steps disclosure — closed when done, live when running */}
                 <AgentSteps
                   steps={msg.steps}
                   isRunning={isRunning && i === messages.length - 1}
@@ -77,20 +76,22 @@ export default function App() {
                   durationMs={msg.durationMs}
                 />
 
-                {/* Final answer card — appears the moment final_answer arrives */}
-                {msg.answer && (
+                {/* WHY: priority order - authoritative answer first, then
+                    the live stream, then the working bubble. The stream
+                    self-corrects: final_answer always replaces it. */}
+                {msg.answer ? (
                   <div className="w-full max-w-[85%]">
                     <FinalAnswer answer={msg.answer} />
                   </div>
-                )}
-
-                {/* WHY: While running with no answer yet, show a raw bubble so
-                    the turn never looks like floating UI without context */}
-                {isRunning && i === messages.length - 1 && !msg.answer && (
+                ) : msg.streamingAnswer ? (
+                  <div className="w-full max-w-[85%]">
+                    <FinalAnswer answer={msg.streamingAnswer} streaming />
+                  </div>
+                ) : isRunning && i === messages.length - 1 ? (
                   <ChatMessage role="agent">
                     <span className="animate-pulse text-sm">Working...</span>
                   </ChatMessage>
-                )}
+                ) : null}
               </div>
             );
           })}

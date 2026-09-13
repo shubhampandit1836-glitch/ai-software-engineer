@@ -1,4 +1,4 @@
-from typing import Annotated, List, Literal, Optional
+from typing import TypedDict, List, Optional, Annotated, Literal, Dict
 import operator
 from typing_extensions import TypedDict
 
@@ -14,6 +14,7 @@ class AgentState(TypedDict):
     plan: List[str]
     current_step_index: int
     current_code: str
+    files: Dict[str, str]
 
     # --- Testing & Security ---
     security_violation: Optional[str]
@@ -44,6 +45,11 @@ def get_initial_state(task_description: str) -> "AgentState":
         "plan": [],
         "current_step_index": 0,
         "current_code": "",
+        # --- Multi-file project tree (v3) ---
+        # WHY: Dict mapping file path -> file contents. The MIRROR of what
+        # exists in the sandbox. State stays the source of truth (future
+        # checkpointer + memory work depends on it); sandbox is execution ground.
+        "files": {},
         "security_violation": None,
         "execution_result": None,
         "execution_error": None,

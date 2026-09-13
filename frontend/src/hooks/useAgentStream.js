@@ -1,9 +1,9 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef } from "react";
 import { streamAgent } from "../api/agent";
 
 /**
  * The brain of the frontend: owns the chat, consumes the SSE stream,
- * and accumulates state across events.
+ * accumulates state across events, and streams tokens into the answer card.
  */
 export default function useAgentStream() {
   const [messages, setMessages] = useState([]);
@@ -14,80 +14,104 @@ export default function useAgentStream() {
   // renders. A closure over useState values would go stale mid-run.
   const stepsRef = useRef([]);
   const answerRef = useRef(null);
+  const streamingRef = useRef("");
   const startTimeRef = useRef(0);
-  const durationRef = useRef(0);
 
   const sendTask = useCallback(async (task) => {
     if (!task.trim()) return;
 
-    // --- 1. Show the user bubble + a placeholder for the agent turn ---
+    // User bubble + placeholder agent turn
     setMessages((prev) => [...prev, { role: "user", text: task }]);
-
-    // WHY: agentRef pattern — we push an object and mutate it as events
-    // arrive, because state updates are async and we'd lose the reference.
-    // Final structure is replaced wholesale at the end.
-    const agentTurn = { role: "agent", steps: [], answer: null, durationMs: 0, failed: false };
-    setMessages((prev) => [...prev, agentTurn]);
-    const turnIndexRef = { current: -1 };
+    setMessages((prev) => [
+      ...prev,
+      { role: "agent", steps: [], answer: null, streamingAnswer: "", durationMs: 0 },
+    ]);
 
     setIsRunning(true);
     setCurrentNode("input_guardrail");
     stepsRef.current = [];
     answerRef.current = null;
+    streamingRef.current = "";
     startTimeRef.current = Date.now();
-    durationRef.current = 0;
+
+    // WHY: one helper updates the LAST agent turn immutably. Functional
+    // setState = no stale closures; index check = never corrupts a user bubble.
+    const updateTurn = (patch) => {
+      setMessages((prev) => {
+        const next = [...prev];
+        const idx = next.length - 1;
+        if (idx >= 0 && next[idx].role === "agent") {
+          next[idx] = { ...next[idx], ...patch };
+        }
+        return next;
+      });
+    };
+
+    // WHY: Groq emits tokens faster than React can re-render + re-parse
+    // markdown. We accumulate in the ref and flush to state at most every
+    // 50ms - the user sees smooth fast typing, the DOM does ~20 updates
+    // instead of hundreds.
+    let flushTimer = null;
+    const flushStream = () => {
+      if (flushTimer) return;
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        updateTurn({ streamingAnswer: streamingRef.current });
+      }, 50);
+    };
+    // WHY: The ghost-timer kill switch. A pending timer that fires AFTER
+    // the turn ends would patch the NEXT turn with the OLD answer's text.
+    // Called on every exit path - end event, error, connection drop.
+    const clearFlushTimer = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+    };
 
     try {
-      // --- 2. Consume the stream ---
       for await (const event of streamAgent(task)) {
-        // Track the CURRENT node for the StatusPill
-        if (event.node && event.node !== "end") {
-          setCurrentNode(event.node);
+        // ---- Token events: type the answer out live ----
+        if (event.type === "token") {
+          // WHY: keeps the phase pill fresh while tokens flow.
+          // setCurrentNode with an unchanged value is a no-op re-render.
+          if (event.node) setCurrentNode(event.node);
+          streamingRef.current += event.content;
+          flushStream();
+          continue;
         }
 
-        // --- 3. The end event: finish the run ---
+        // ---- End event: seal the turn ----
         if (event.node === "end") {
-          durationRef.current = Date.now() - startTimeRef.current;
+          clearFlushTimer(); // WHY: kill the ghost before sealing
+          updateTurn({
+            durationMs: Date.now() - startTimeRef.current,
+            streamingAnswer: "",
+          });
           break;
         }
 
-        // --- 4. Accumulate state across events ---
-        // WHY: THE MERGE STRATEGY. LangGraph's 'updates' mode sometimes
-        // bundles multiple nodes into one event (we saw direct_answer's
-        // payload arrive inside intent_classifier's event). Merging every
-        // non-null field into a snapshot makes us immune to that — the
-        // final_answer displays no matter which event carried it.
+        // ---- Node updates: pill, steps, authoritative answer ----
+        if (event.node) setCurrentNode(event.node);
         if (event.final_answer) answerRef.current = event.final_answer;
-
-        if (event.plan) {
-          // WHY: Store the LATEST plan — later planner events would
-          // overwrite, but plans arrive once per run in our graph.
-          stepsRef.current.plan = event.plan;
-        }
 
         stepsRef.current.push({
           ...event,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          timestamp: new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
         });
 
-        // --- 5. Live-update the agent turn in the messages array ---
-        setMessages((prev) => {
-          const next = [...prev];
-          const idx = next.length - 1;
-          // WHY: Guard — only mutate if the last message is really our agent turn.
-          if (idx >= 0 && next[idx].role === "agent") {
-            next[idx] = {
-              ...next[idx],
-              steps: [...stepsRef.current],
-              answer: answerRef.current,
-              durationMs: Date.now() - startTimeRef.current,
-            };
-          }
-          return next;
+        // WHY: when final_answer arrives it REPLACES the streamed text -
+        // the authoritative version (cleaned, complete format) always wins.
+        updateTurn({
+          steps: [...stepsRef.current],
+          answer: answerRef.current,
         });
       }
     } catch (error) {
-      // --- 6. Error becomes an honest answer, never a blank screen ---
       stepsRef.current.push({
         node: "error",
         status: "failed",
@@ -95,24 +119,21 @@ export default function useAgentStream() {
         timestamp: new Date().toLocaleTimeString(),
       });
       answerRef.current = `⚠️ **Connection error**\n\n${error.message}\n\nIs the backend running on port 8000?`;
-      setMessages((prev) => {
-        const next = [...prev];
-        const idx = next.length - 1;
-        if (idx >= 0 && next[idx].role === "agent") {
-          next[idx] = { ...next[idx], failed: true, steps: [...stepsRef.current], answer: answerRef.current };
-        }
-        return next;
+      updateTurn({
+        failed: true,
+        steps: [...stepsRef.current],
+        answer: answerRef.current,
+        streamingAnswer: "",
       });
     } finally {
-      // --- 7. Seal the turn ---
-      durationRef.current = Date.now() - startTimeRef.current;
-      setMessages((prev) => {
-        const next = [...prev];
-        const idx = next.length - 1;
-        if (idx >= 0 && next[idx].role === "agent") {
-          next[idx] = { ...next[idx], durationMs: durationRef.current, answer: answerRef.current, steps: [...stepsRef.current] };
-        }
-        return next;
+      // WHY: fires for EVERY exit path (break, catch, stream end) -
+      // the ghost-timer cannot survive this line.
+      clearFlushTimer();
+      updateTurn({
+        durationMs: Date.now() - startTimeRef.current,
+        answer: answerRef.current,
+        streamingAnswer: "",
+        steps: [...stepsRef.current],
       });
       setIsRunning(false);
       setCurrentNode(null);
