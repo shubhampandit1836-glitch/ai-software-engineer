@@ -6,6 +6,9 @@ from app.agent.safety import (
     intent_classifier_node,
     security_scanner_node,
 )
+import logging
+from langgraph.checkpoint.postgres import PostgresSaver
+
 from app.agent.nodes import planner_node, coder_node, tester_node, reviewer_node
 from app.agent.answer_nodes import (
     direct_answer_node,
@@ -72,8 +75,14 @@ def route_after_testing(state: AgentState) -> Literal["coder", "reviewer", "synt
     return "synthesizer"
 
 
-def create_agent_graph():
-    """Builds and compiles the v2 safety-first agent state machine."""
+def _build_workflow() -> StateGraph:
+    """Builds the agent workflow graph WITHOUT compiling it.
+
+    WHY separate from compile: LangGraph's .compile() is a one-way
+    transformation - you cannot compile again with a different checkpointer.
+    Returning the raw StateGraph lets callers choose their own compile
+    options (no checkpointer for stateless use, PostgresSaver for threads).
+    """
     workflow = StateGraph(AgentState)
 
     # --- Nodes ---
@@ -136,8 +145,66 @@ def create_agent_graph():
     workflow.add_edge("synthesizer", END)
     workflow.add_edge("failure_answer", END)
 
-    return workflow.compile()
+    return workflow
 
 
-# Singleton compiled graph instance ready for streaming
+def create_agent_graph():
+    """Builds and compiles the agent graph (no checkpointer - stateless)."""
+    return _build_workflow().compile()
+
+
+logger = logging.getLogger(__name__)
 agent_graph = create_agent_graph()
+
+# WHY module-level None: the stateful graph is initialized in
+# async_setup_stateful_graph() called from FastAPI lifespan, because
+# AsyncConnectionPool.open() requires a running event loop. At import
+# time no event loop exists yet, so we build the graph skeleton here
+# and open the pool connection in the lifespan hook.
+agent_graph_stateful = None
+_async_checkpoint_pool = None
+
+
+async def async_setup_stateful_graph() -> None:
+    """Opens the async checkpoint pool and compiles the stateful graph.
+
+    Must be called once from the FastAPI lifespan (startup) hook - at that
+    point uvicorn's event loop is running, so AsyncConnectionPool.open()
+    and any awaitable setup calls succeed.
+    """
+    global agent_graph_stateful, _async_checkpoint_pool
+    try:
+        import os
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from psycopg_pool import AsyncConnectionPool, ConnectionPool
+
+        conninfo = os.environ["DATABASE_URL"]
+        if "sslmode" not in conninfo:
+            conninfo += "?sslmode=require"
+
+        # WHY sync pool for setup only: CREATE INDEX CONCURRENTLY must run
+        # in autocommit mode. We open one sync connection, run setup, close
+        # immediately - this is the one blocking call we allow at startup.
+        _setup_pool = ConnectionPool(
+            conninfo=conninfo, min_size=1, max_size=1,
+            kwargs={"autocommit": True}, open=True,
+        )
+        PostgresSaver(_setup_pool).setup()  # type: ignore[arg-type]
+        _setup_pool.close()
+
+        # WHY AsyncConnectionPool: ainvoke/astream are async; the sync
+        # PostgresSaver raises NotImplementedError on every async call.
+        _async_checkpoint_pool = AsyncConnectionPool(
+            conninfo=conninfo, min_size=1, max_size=3,
+            kwargs={"autocommit": True}, open=False,
+        )
+        await _async_checkpoint_pool.open()
+
+        _checkpointer = AsyncPostgresSaver(_async_checkpoint_pool)  # type: ignore[arg-type]
+        agent_graph_stateful = _build_workflow().compile(checkpointer=_checkpointer)
+        logger.info("AsyncPostgresSaver ready - stateful threads enabled.")
+    except Exception as e:
+        logger.warning(
+            "AsyncPostgresSaver unavailable (%s) - threads engine disabled.", e,
+        )
+        agent_graph_stateful = None

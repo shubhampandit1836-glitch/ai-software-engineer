@@ -35,7 +35,9 @@ jobs:
       # API, so a fake key passes construction and is never validated.
       # Real keys NEVER go in workflow files.
       - name: Set dummy env vars
-        run: echo "GROQ_API_KEY=gci-dummy-key-for-import-only" >> $GITHUB_ENV
+        run: |
+          echo "GROQ_API_KEY=gci-dummy-key-for-import-only" >> $GITHUB_ENV
+          echo "DATABASE_URL=postgresql://user:pass@localhost:5432/db" >> $GITHUB_ENV
 
       - name: Run unit tests
         run: python -m pytest

@@ -8,6 +8,6 @@ e2b-code-interpreter==1.0.3
 python-dotenv==1.0.1
 pydantic==2.10.2
 langgraph-checkpoint==2.1.2
-langgraph-checkpoint-postgres==2.0.25
+langgraph-checkpoint-postgres==2.0.13
 psycopg[binary]==3.3.5
-psycopg-pool==3.3.1
+psycopg-pool==3.3.1

@@ -156,6 +156,15 @@ Return ONLY a numbered list. Do not write code yet."""
     return {
         "plan": plan_steps,
         "current_step_index": 0,
+        # WHY resets: once the checkpointer (4a.3) persists state across
+        # messages in a thread, a FAILED run would leave review_attempts=3
+        # in storage - and the next task in that thread would inherit a
+        # burned-out budget and fail instantly. Every new task starts with
+        # a clean slate: fresh file tree, zero attempts, no stale errors.
+        "files": {},
+        "review_attempts": 0,
+        "execution_error": None,
+        "security_violation": None,
         "status": "planning_complete",
         "messages": [response],
     }

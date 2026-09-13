@@ -1,11 +1,17 @@
 import json
+import uuid
 from typing import Any, AsyncGenerator, Dict
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from app.agent.graph import agent_graph, RECURSION_LIMIT
+# WHY import the MODULE, not the variable: agent_graph_stateful is None at
+# import time and only assigned later (lifespan startup). 'from x import y'
+# COPIES the current value - the copy would stay None forever. Module
+# attribute access (graph.agent_graph_stateful) always reads the live value.
+from app.agent import graph as graph_module
+from app.agent.graph import RECURSION_LIMIT
 from app.agent.state import get_initial_state
-from app.tools.sandbox_manager import destroy_sandbox
+from app.tools.sandbox_manager import destroy_sandbox, set_current_thread
 
 router = APIRouter()
 
@@ -42,6 +48,11 @@ def _build_payload(node_name: str, node_output: Dict[str, Any]) -> Dict[str, Any
 
 async def stream_agent_execution(task_description: str) -> AsyncGenerator[str, None]:
     """Streams LangGraph node updates to the client via Server-Sent Events."""
+    # WHY unique per request: guarantees sandbox isolation across concurrent
+    # requests and prevents cross-contamination on destroy.
+    case_thread_id = f"stream-{uuid.uuid4().hex[:12]}"
+    set_current_thread(case_thread_id)
+
     # WHY: The factory guarantees all 13 state fields exist - no hand-built
     # dicts that drift out of sync with AgentState.
     initial_state = get_initial_state(task_description)
@@ -108,7 +119,7 @@ async def stream_agent_execution(task_description: str) -> AsyncGenerator[str, N
         # WHY: THE guaranteed cleanup. Every stream exit path - completion,
         # client disconnect, crash - destroys the persistent sandbox. A
         # leaked sandbox burns E2B credits until E2B's own timeout reaps it.
-        destroy_sandbox()
+        destroy_sandbox(case_thread_id)
 
 
 @router.post("/agent/stream")

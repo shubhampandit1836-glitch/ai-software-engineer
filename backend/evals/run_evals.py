@@ -5,10 +5,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
-
+import uuid
+from app.tools.sandbox_manager import destroy_sandbox, set_current_thread
 from app.agent.graph import agent_graph, RECURSION_LIMIT
 from app.agent.state import get_initial_state
-from app.tools.sandbox_manager import destroy_sandbox
+
 
 # WHY: built from chr(96) so this file stays copy-paste-proof.
 FENCE = chr(96) * 3
@@ -46,6 +47,10 @@ MILESTONE_CASES: List[str] = [
 async def run_case(task: str) -> Dict[str, Any]:
     """Runs one task through the FULL graph; returns the fields we score on."""
     start = time.monotonic()
+    # WHY unique per case: guarantees sandbox isolation even if two eval
+    # cases ever run concurrently.
+    case_thread_id = f"eval-{task[:24]}-{uuid.uuid4().hex[:8]}"
+    set_current_thread(case_thread_id)
     try:
         result = await agent_graph.ainvoke(
             get_initial_state(task),
@@ -64,7 +69,9 @@ async def run_case(task: str) -> Dict[str, Any]:
         # Each case must destroy its own sandbox - both to avoid leaking
         # E2B credits AND to prevent case 2 reusing case 1's files
         # (a stale sandbox turns failures into FALSE PASSES).
-        destroy_sandbox()
+        # NEW: evals now set an explicit per-case thread_id, so concurrent
+        # future use can never cross-contaminate; destroy targets that id.
+        destroy_sandbox(case_thread_id)
 
 def score_guardrail(r: Dict[str, Any]) -> tuple[bool, str]:
     if r["status"] != "rejected":
