@@ -41,34 +41,46 @@ async def direct_answer_node(state: AgentState) -> Dict[str, Any]:
 
 async def synthesizer_node(state: AgentState) -> Dict[str, Any]:
     """Composes the final user-facing answer after a successful coding run."""
-    task = state.get("task_description"), ""
-    code = state.get("current_code", "")
-    execution_result = state.get("execution_result") or "No output captured"
-    
-    # WHY: The LLM writes ONLY the explanation. The code and output are
-    # assembled deterministically in Python below — an LLM re-transcribing
-    # code WILL eventually corrupt it (dropped lines, renamed variables).
-    system_prompt = f"""You are presenting completed work to a non-technical user.
-    The task was: "{task}"
-    The program was written, executed in a secure sandbox, and passed all checks.
+    task = state.get("task_description", "")
+    files = state.get("files") or {}
+    execution_result = state.get("execution_result") or "No output captured."
 
-    Write a 2-3 sentence summary in plain language: what the program does and how
-    it works. Do NOT include any code. Do NOT include the program output."""
-    
+    # WHY: v3 is file-mode - the answer renders the FILE TREE. current_code
+    # is legacy (v2 single-file). The fallback keeps old runs working.
+    if not files and state.get("current_code"):
+        files = {"main.py": state["current_code"]}
+
+    fence = chr(96) * 3
+
+    # WHY: deterministic assembly in Python - the LLM writes ONLY the
+    # explanation. Re-transcribing code through the model corrupts it.
+    code_section = ""
+    for path in sorted(files.keys()):
+        code_section += f"\n\n**{path}**\n{fence}python\n{files[path]}{fence}"
+
+    repo_for_prompt = "\n".join(sorted(files.keys()))
+
+    system_prompt = f"""You are presenting completed work to a non-technical user.
+The task was: "{task}"
+The project files are: {repo_for_prompt}
+The program was written, executed in a secure sandbox, and passed all checks.
+
+Write a 2-3 sentence summary in plain language: what the program does and how
+it works. Do NOT include any code. Do NOT include the program output."""
+
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=f"Program code:\n```python\n{code}\n```"),
+        HumanMessage(content="Write the summary."),
     ]
-    
     response = await invoke_with_retry(llm_fast, messages)
     explanation = response.content
     if not isinstance(explanation, str):
         explanation = "\n".join(str(item) for item in explanation)
 
     final_answer = (
-        f"{explanation.strip()}\n\n"
-        f"```python\n{code}\n```\n\n"
-        f"**✅ Verified output:**\n```\n{execution_result}\n```"
+        f"{explanation.strip()}\n"
+        f"{code_section}\n\n"
+        f"**✅ Verified output:**\n{fence}\n{execution_result}\n{fence}"
     )
 
     return {"final_answer": final_answer, "status": "synthesized"}

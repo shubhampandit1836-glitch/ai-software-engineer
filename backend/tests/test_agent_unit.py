@@ -13,6 +13,7 @@ from typing import cast
 from app.agent.state import AgentState, get_initial_state
 from app.agent.safety import _extract_intent, security_scanner_node
 from app.agent.nodes import _extract_code, _clean
+from app.agent.nodes import _parse_file_operations
 from app.agent.graph import (
     MAX_REVIEW_ATTEMPTS,
     route_after_guardrail,
@@ -78,24 +79,30 @@ def test_extract_code_plain_passthrough():
 # ---------- security scanner (async, zero network) ----------
 
 async def test_scanner_clean_code():
-    r = await security_scanner_node(_state(current_code="print('hello world')"))
+    r = await security_scanner_node(_state(files={"main.py": "print('hello world')"}))
     assert r["status"] == "security_clean"
     assert r["security_violation"] is None
 
 async def test_scanner_flags_subprocess():
     code = "import subprocess\nsubprocess.run(['ls'])"
-    r = await security_scanner_node(_state(current_code=code))
+    r = await security_scanner_node(_state(files={"main.py": code}))
     assert r["status"] == "security_violation"
     assert "subprocess" in r["security_violation"]
 
 async def test_scanner_flags_infinite_loop_without_break():
-    r = await security_scanner_node(_state(current_code="while True:\n    print('spam')"))
+    r = await security_scanner_node(_state(files={"main.py": "while True:\n    print('spam')"}))
     assert r["status"] == "security_violation"
     assert "infinite loop" in r["security_violation"]
 
 async def test_scanner_allows_loop_with_break():
-    r = await security_scanner_node(_state(current_code="while True:\n    break"))
+    r = await security_scanner_node(_state(files={"main.py": "while True:\n    break"}))
     assert r["status"] == "security_clean"
+
+async def test_scanner_violation_names_the_file():
+    # WHY: v3 scans a FILE TREE - the report must say WHICH file,
+    # or the reviewer is fixing blind
+    r = await security_scanner_node(_state(files={"src/util.py": "import os\nos.system('ls')"}))
+    assert "src/util.py" in r["security_violation"]
 
 
 # ---------- routers (pure functions - the graph's decision logic) ----------
@@ -142,3 +149,43 @@ def test_route_security_violation_goes_to_reviewer():
 
 def test_route_security_clean_goes_to_tester():
     assert route_after_security(_state(status="security_clean")) == "tester"
+
+def test_parse_single_file():
+    raw = "FILE: main.py\nprint('hi')\nENDFILE"
+    assert _parse_file_operations(raw) == {"main.py": "print('hi')\n"}
+
+def test_parse_multiple_files():
+    raw = "FILE: a.py\nx = 1\nENDFILE\nFILE: b.py\ny = 2\nENDFILE"
+    assert _parse_file_operations(raw) == {"a.py": "x = 1\n", "b.py": "y = 2\n"}
+
+def test_parse_salvages_unterminated_file():
+    # WHY: max_tokens cutoff mid-file - we keep the partial, never drop it
+    raw = "FILE: main.py\nx = 1\ny = 2"
+    result = _parse_file_operations(raw)
+    assert "main.py" in result
+    assert "x = 1" in result["main.py"]
+
+def test_parse_ignores_preamble():
+    raw = "Here are the files:\nFILE: a.py\nz = 3\nENDFILE"
+    assert _parse_file_operations(raw) == {"a.py": "z = 3\n"}
+
+def test_parse_empty_returns_empty():
+    assert _parse_file_operations("no files here at all") == {}
+
+
+# ---------- _parse_file_operations: fence stripping (v3) ----------
+
+def test_parse_strips_wrapping_python_fence():
+    raw = "FILE: main.py\n" + FENCE + "python\nx = 1\n" + FENCE + "\nENDFILE"
+    assert _parse_file_operations(raw) == {"main.py": "x = 1\n"}
+
+def test_parse_strips_bare_fence_wrap():
+    raw = "FILE: util.py\n" + FENCE + "\ny = 2\n" + FENCE + "\nENDFILE"
+    assert _parse_file_operations(raw) == {"util.py": "y = 2\n"}
+
+def test_parse_keeps_interior_fences():
+    # WHY: a Python file that CONTAINS fence text mid-file must not be
+    # mutilated - only the first+last wrap pattern is stripped
+    content = 'doc = "```"'
+    raw = f"FILE: gen.py\nprint({content!r})\nENDFILE"
+    assert "```" in _parse_file_operations(raw)["gen.py"]

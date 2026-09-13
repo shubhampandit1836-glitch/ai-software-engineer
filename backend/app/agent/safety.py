@@ -145,28 +145,30 @@ _DANGEROUS_CODE_PATTERNS = [
 ]
 COMPILED_CODE_PATTERNS = [(re.compile(p, re.IGNORECASE), desc) for p, desc in _DANGEROUS_CODE_PATTERNS]
 
-
 async def security_scanner_node(state: AgentState) -> Dict[str, Any]:
-    """Static security analysis of LLM-generated code BEFORE sandbox execution."""
-    code = state.get("current_code", "")
+    """Static security analysis of every project file BEFORE sandbox execution.
+
+    WHY: v2 scanned the single current_code string; v3 is file-mode, so this
+    scans every file in state['files']. Note write_file ALSO scans pre-write
+    (layer 3 lives in two places by design - the tool gate is the enforcement
+    point, this graph node is the verification pass that routes violations
+    into the reviewer loop).
+    """
+    files = state.get("files") or {}
 
     violations = []
-    for pattern, description in COMPILED_CODE_PATTERNS:
-        if pattern.search(code):
-            violations.append(description)
+    for path, content in files.items():
+        for pattern, description in COMPILED_CODE_PATTERNS:
+            if pattern.search(content):
+                violations.append(f"{path}: {description}")
 
-    # WHY: 'while True:' with no 'break' burns sandbox minutes and looks
-    # like a hung app. Soft-block it so the reviewer removes it.
-    if re.search(r"while\s+True\s*:", code) and "break" not in code:
-        violations.append("infinite loop: 'while True:' with no 'break' statement")
+        if re.search(r"while\s+True\s*:", content) and "break" not in content:
+            violations.append(f"{path}: infinite loop: 'while True:' with no 'break' statement")
 
     if violations:
-        # WHY: We format violations like an ERROR REPORT on purpose — the
-        # existing Reviewer self-healing loop then fixes security issues
-        # exactly like it fixes runtime bugs. One loop, two jobs.
         violation_report = (
-            "SECURITY VIOLATION — remove or replace these dangerous "
-            "operations with safe alternatives:\n- " + "\n- ".join(violations)
+            "SECURITY VIOLATION - remove or replace these dangerous operations "
+            "with safe alternatives:\n- " + "\n- ".join(violations)
         )
         return {
             "security_violation": violation_report,

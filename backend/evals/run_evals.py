@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 from app.agent.graph import agent_graph, RECURSION_LIMIT
 from app.agent.state import get_initial_state
+from app.tools.sandbox_manager import destroy_sandbox
 
 # WHY: built from chr(96) so this file stays copy-paste-proof.
 FENCE = chr(96) * 3
@@ -38,19 +39,25 @@ CODING_CASES: List[str] = [
 async def run_case(task: str) -> Dict[str, Any]:
     """Runs one task through the FULL graph; returns the fields we score on."""
     start = time.monotonic()
-    result = await agent_graph.ainvoke(
-        get_initial_state(task),
-        config={"recursion_limit": RECURSION_LIMIT},
-    )
-    duration = time.monotonic() - start
-    return {
-        "task": task,
-        "intent": result.get("intent"),
-        "status": result.get("status"),
-        "final_answer": result.get("final_answer") or "",
-        "duration_s": round(duration, 1),
-    }
-
+    try:
+        result = await agent_graph.ainvoke(
+            get_initial_state(task),
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+        duration = time.monotonic() - start
+        return {
+            "task": task,
+            "intent": result.get("intent"),
+            "status": result.get("status"),
+            "final_answer": result.get("final_answer") or "",
+            "duration_s": round(duration, 1),
+        }
+    finally:
+        # WHY: evals bypass routes.py, which owns cleanup in production.
+        # Each case must destroy its own sandbox - both to avoid leaking
+        # E2B credits AND to prevent case 2 reusing case 1's files
+        # (a stale sandbox turns failures into FALSE PASSES).
+        destroy_sandbox()
 
 def score_guardrail(r: Dict[str, Any]) -> tuple[bool, str]:
     if r["status"] != "rejected":
@@ -74,7 +81,13 @@ def score_general(r: Dict[str, Any]) -> tuple[bool, str]:
 
 def score_coding(r: Dict[str, Any]) -> tuple[bool, str]:
     if r["status"] == "failed_final":
-        return False, "agent gave up after review attempts"
+        # WHY: embed the ACTUAL last failure in the FAIL line - evals
+        # must point at the root cause, not a generic "gave up".
+        answer = r["final_answer"]
+        if "Last failure" in answer:
+            snippet = answer.split("Last failure")[1][:120].replace("\n", " ").strip()
+            return False, f"failed_final | {snippet}"
+        return False, "failed_final (no failure detail)"
     if r["status"] != "synthesized":
         return False, f"expected synthesized, got '{r['status']}'"
     if FENCE + "python" not in r["final_answer"]:

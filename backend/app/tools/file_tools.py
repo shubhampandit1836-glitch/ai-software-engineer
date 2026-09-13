@@ -128,7 +128,6 @@ def list_files() -> str:
     except Exception as e:
         return f"Sandbox list error: {str(e)}"
 
-
 @tool
 def run_command(command: str) -> str:
     """Runs an allowlisted shell command in the sandbox (pip install, python, pytest, ls, cat, find, tree, pwd, echo).
@@ -142,18 +141,38 @@ def run_command(command: str) -> str:
 
     try:
         sb = get_sandbox()
-        result = sb.commands.run(command)  # type: ignore[union-attr]
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        # WHY truncate: pytest -v on a big project can be 50KB of output -
-        # that flows straight into LLM context and eats the token budget.
-        # 8KB chars is roughly 2K tokens, plenty for diagnosing failures.
+        try:
+            result = sb.commands.run(command)  # type: ignore[union-attr]
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            exit_code = result.exit_code
+        except Exception as cmd_err:
+            # WHY: the e2b SDK (v1.x) RAISES when a command exits non-zero
+            # instead of returning a result. The message carries the exit
+            # code and stderr - we parse it so the caller gets the SAME
+            # 'EXIT N' contract either way. Without this, a plain code bug
+            # (SyntaxError, exit 1) was mislabeled 'Sandbox command error'
+            # -> misrouted to infrastructure_error -> no reviewer attempt.
+            msg = str(cmd_err)
+            exit_code = 1
+            if "exited with code" in msg:
+                try:
+                    exit_code = int(msg.split("exited with code")[1].split()[0])
+                except (ValueError, IndexError):
+                    exit_code = 1
+            stdout = ""
+            stderr = msg
+
         MAX_OUTPUT = 8000
         output = (stdout + ("\n--- stderr ---\n" + stderr if stderr else "")).strip()
         if len(output) > MAX_OUTPUT:
             output = output[:MAX_OUTPUT] + "\n...[output truncated]"
-        if result.exit_code == 0:
+
+        if exit_code == 0:
             return f"EXIT 0\n{output}"
-        return f"EXIT {result.exit_code} (FAILED)\n{output}"
+        return f"EXIT {exit_code} (FAILED)\n{output}"
     except Exception as e:
+        # WHY: only TRUE infrastructure failures (connection dead, sandbox
+        # gone) land here now. Command failures are exit codes, not
+        # exceptions - the distinction routes code bugs to the reviewer.
         return f"Sandbox command error: {str(e)}"

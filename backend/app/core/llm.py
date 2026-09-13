@@ -1,6 +1,6 @@
 import os
 import asyncio
-from typing import List
+from typing import Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage
@@ -43,7 +43,7 @@ llm_smart = _build_llm(SMART_MODEL, temperature=0.2, max_tokens=950)
 
 MAX_RETRIES = 3
 
-async def invoke_with_retry(llm: ChatGroq, messages: List[BaseMessage]) -> BaseMessage:
+async def invoke_with_retry(llm: ChatGroq, messages: Sequence[BaseMessage]) -> BaseMessage:
     """
     Invokes an LLM with exponential backoff on rate-limit errors.
     """
