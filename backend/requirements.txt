@@ -8,6 +8,9 @@ e2b-code-interpreter==1.0.3
 python-dotenv==1.0.1
 pydantic==2.10.2
 langgraph-checkpoint==2.1.2
+# WHY 2.0.13 exactly: 3.x drags langgraph-checkpoint to 4.x and breaks
+# langgraph 0.2.53; later 2.0.x emit DeprecationWarnings. Era-matched pin -
+# and it must appear EXACTLY ONCE across ALL requirement files.
 langgraph-checkpoint-postgres==2.0.13
 psycopg[binary]==3.3.5
-psycopg-pool==3.3.1
+psycopg-pool==3.3.1
