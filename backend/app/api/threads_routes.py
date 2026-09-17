@@ -1,12 +1,14 @@
-"""Thread + background-run API (v4a.3).
+"""Thread + background-run API (v4a.4).
 
 Contract: thread_id is THE key everywhere - ContextVar sandbox routing,
 LangGraph checkpoint thread_id, and thread_events storage. One id, four jobs.
 """
 import asyncio
 import json
+import logging
+import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -20,6 +22,8 @@ from app.agent.graph import RECURSION_LIMIT
 from app.agent.state import get_initial_state
 from app.core.db import get_pool
 from app.tools.sandbox_manager import destroy_sandbox, set_current_thread
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -46,6 +50,7 @@ def _persist_event(thread_id: str, seq: int, event: Dict[str, Any]) -> None:
         )
         conn.commit()
 
+
 def _next_seq(pool, thread_id: str) -> int:
     """Next event sequence for a thread (MAX(seq)+1).
 
@@ -62,6 +67,76 @@ def _next_seq(pool, thread_id: str) -> int:
     assert row is not None
     return row[0] + 1
 
+
+def _thread_exists(thread_id: str) -> bool:
+    """Sync existence check, offloaded from the async endpoint."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM threads WHERE id = %s", (thread_id,)
+        ).fetchone()
+    return row is not None
+
+
+def _record_user_message(thread_id: str, task: str) -> None:
+    """Title update + user-message event: ALL sync DB work for start_run.
+
+    WHY one function: the async endpoint offloads every blocking psycopg
+    call in a single asyncio.to_thread - a blocking call run directly on
+    the event loop stalls every concurrent request AND the in-flight agent
+    run (even its LLM awaits: httpx response callbacks need the loop).
+    """
+    pool = get_pool()
+    # First message becomes the title (sidebar convention).
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE threads SET title = %s, updated_at = now() "
+            "WHERE id = %s AND title = 'New chat'",
+            (task[:60], thread_id),
+        )
+        conn.commit()
+    # WHY persist the user's message as an event: the event stream is the
+    # single source of truth for the WHOLE conversation - user turns
+    # included. Client-only bubbles vanished on every thread switch, and
+    # only server-side events can interleave prompts with answers by seq.
+    user_seq = _next_seq(pool, thread_id)
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO thread_events (thread_id, seq, event) VALUES (%s, %s, %s)",
+            (
+                thread_id,
+                user_seq,
+                json.dumps({"node": "user", "type": "user_message", "content": task}),
+            ),
+        )
+        conn.commit()
+
+
+def _delete_thread_rows(thread_id: str) -> None:
+    """All sync DB deletion for delete_thread (same WHY as above)."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM threads WHERE id = %s", (thread_id,)
+        ).fetchone()
+    if row is None:
+        # WHY KeyError, not HTTPException: this runs inside to_thread - a
+        # plain exception crosses cleanly and the endpoint maps it to 404.
+        raise KeyError(thread_id)
+    # WHY separate connection: a failed statement aborts a postgres
+    # transaction, so best-effort cleanup gets its own connection.
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
+            conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
+            conn.commit()
+    except Exception:
+        pass  # checkpoint schema varies by version - non-fatal
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM threads WHERE id = %s", (thread_id,))  # events cascade
+        conn.commit()
+
+
 async def _run_agent_background(thread_id: str, task: str) -> None:
     """The background engine: streams the graph, persists every event,
     guarantees sandbox cleanup. Runs detached from any HTTP connection.
@@ -71,10 +146,24 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
     isolation real the moment the graph starts executing.
     """
     set_current_thread(thread_id)
-    # WHY resume the sequence: multiple runs share one thread - starting
-    # at 0 collides with the UNIQUE(thread_id, seq) constraint.
-    seq = _next_seq(get_pool(), thread_id)
+    # WHY phase timing: "the answer is slow" must decompose into LLM time
+    # vs DB time vs graph time from the terminal - not guesswork. Every
+    # phase logs seconds since run start.
+    run_started = time.perf_counter()
+
+    def _mark(label: str) -> None:
+        logger.info(
+            "run phase: thread=%s t=%.1fs %s",
+            thread_id[:8],
+            time.perf_counter() - run_started,
+            label,
+        )
+
+    # WHY to_thread: _next_seq is a blocking SELECT - on the loop it would
+    # freeze every concurrent request mid-poll.
+    seq = await asyncio.to_thread(_next_seq, get_pool(), thread_id)
     initial_state = get_initial_state(task)
+    _mark("engine ready, graph starting")
 
     try:
         # WHY graph_module: the stateful graph only exists after lifespan
@@ -113,16 +202,19 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
                     "final_answer": node_output.get("final_answer"),
                 }
                 await asyncio.to_thread(_persist_event, thread_id, seq, event)
+                _mark(f"persisted node={node_name} seq={seq}")
                 seq += 1
 
         # THE ONLY completion event - one per run, always last.
         await asyncio.to_thread(
             _persist_event, thread_id, seq, {"node": "end", "status": "completed"}
         )
+        _mark("completed")
 
     except Exception as e:
         # Even a crashed run must produce an end marker - otherwise the
         # frontend polls forever on a dead thread.
+        _mark(f"failed: {type(e).__name__}")
         try:
             await asyncio.to_thread(
                 _persist_event,
@@ -134,15 +226,29 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
             pass  # DB down too - nothing more we can do
     finally:
         # Guaranteed cleanup on EVERY exit path - the 4a.2 registry makes
-        # this surgical: only THIS thread's sandbox dies.
-        destroy_sandbox(thread_id)
+        # this surgical: only THIS thread's sandbox dies. WHY pop FIRST:
+        # pure in-memory work, so it always runs even if the kill below
+        # fails; a stale registry entry would 409 this thread forever.
+        # to_thread because the E2B kill is blocking network I/O.
         _running_tasks.pop(thread_id, None)
+        try:
+            await asyncio.to_thread(destroy_sandbox, thread_id)
+        except Exception:
+            pass  # E2B reaps orphaned sandboxes on its own timeout
+        _mark("sandbox cleaned, run task exiting")
 
 
 @router.post("/threads")
-async def create_thread():
+def create_thread():
     """Creates a new chat thread. Title defaults; first user message later
-    becomes the sidebar title (4a.4 convention)."""
+    becomes the sidebar title (4a.4 convention).
+
+    WHY plain `def` (NOT async): this handler is 100% blocking psycopg. An
+    `async def` handler runs ON the event loop - every blocking DB call
+    inside it freezes ALL concurrent activity, including an in-flight agent
+    run. FastAPI runs plain `def` endpoints in its threadpool - the loop
+    never blocks.
+    """
     thread_id = str(uuid.uuid4())
     pool = get_pool()
     with pool.connection() as conn:
@@ -155,8 +261,8 @@ async def create_thread():
 
 
 @router.get("/threads")
-async def list_threads():
-    """Sidebar data: every thread, newest first."""
+def list_threads():
+    """Sidebar data: every thread, newest first. (Same WHY as create_thread.)"""
     pool = get_pool()
     with pool.connection() as conn:
         rows = conn.execute(
@@ -176,7 +282,12 @@ async def list_threads():
 
 @router.post("/threads/{thread_id}/run")
 async def start_run(thread_id: str, request: RunRequest):
-    """Starts a background agent run for this thread. Returns immediately."""
+    """Starts a background agent run for this thread. Returns immediately.
+
+    WHY async (unlike the endpoints above): this handler must create the
+    asyncio.Task on the event loop. All its blocking DB work is offloaded
+    via to_thread so the loop stays free.
+    """
     # WHY 503 not silent fallback: a run that "works" but doesn't persist
     # is a mystery failure later. Loud and explicit beats quietly degraded.
     if graph_module.agent_graph_stateful is None:
@@ -184,44 +295,16 @@ async def start_run(thread_id: str, request: RunRequest):
             status_code=503,
             detail="Persistence layer unavailable - restart the server with a working DATABASE_URL.",
         )
-    pool = get_pool()
-
-    with pool.connection() as conn:
-        row = conn.execute(
-            "SELECT id FROM threads WHERE id = %s", (thread_id,)
-        ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
 
     if thread_id in _running_tasks and not _running_tasks[thread_id].done():
         # WHY reject instead of queue: one active run per thread is a clear
         # contract. Queueing silently is how out-of-order answers happen.
         raise HTTPException(status_code=409, detail="A run is already active for this thread")
 
-    # First message becomes the title (sidebar convention).
-    with pool.connection() as conn:
-        conn.execute(
-            "UPDATE threads SET title = %s, updated_at = now() "
-            "WHERE id = %s AND title = 'New chat'",
-            (request.task[:60], thread_id),
-        )
-        conn.commit()
+    if not await asyncio.to_thread(_thread_exists, thread_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
 
-    # WHY persist the user's message as an event: the event stream is the
-    # single source of truth for the WHOLE conversation - user turns
-    # included. Client-only bubbles vanished on every thread switch, and
-    # only server-side events can interleave prompts with answers by seq.
-    user_seq = _next_seq(pool, thread_id)
-    with pool.connection() as conn:
-        conn.execute(
-            "INSERT INTO thread_events (thread_id, seq, event) VALUES (%s, %s, %s)",
-            (
-                thread_id,
-                user_seq,
-                json.dumps({"node": "user", "type": "user_message", "content": request.task}),
-            ),
-        )
-        conn.commit()
+    await asyncio.to_thread(_record_user_message, thread_id, request.task)
 
     task = asyncio.create_task(_run_agent_background(thread_id, request.task))
     _running_tasks[thread_id] = task
@@ -229,8 +312,9 @@ async def start_run(thread_id: str, request: RunRequest):
 
 
 @router.get("/threads/{thread_id}/events")
-async def get_events(thread_id: str, after: int = 0):
-    """Replay + live polling endpoint: all events after seq N, plus run state."""
+def get_events(thread_id: str, after: int = 0):
+    """Replay + live polling endpoint: all events after seq N, plus run state.
+    (Same WHY as create_thread - blocking psycopg belongs off the loop.)"""
     pool = get_pool()
 
     with pool.connection() as conn:
@@ -240,6 +324,8 @@ async def get_events(thread_id: str, after: int = 0):
             (thread_id, after),
         ).fetchall()
 
+    # WHY safe from a threadpool thread: Task.done() only reads a flag; the
+    # worst possible race is one extra poll reporting the previous state.
     is_running = (
         thread_id in _running_tasks and not _running_tasks[thread_id].done()
     )
@@ -250,32 +336,23 @@ async def get_events(thread_id: str, after: int = 0):
         "is_running": is_running,
     }
 
+
 @router.delete("/threads/{thread_id}")
 async def delete_thread(thread_id: str):
     """Deletes a thread: cancels any live run, kills its sandbox, cascades
-    events, and best-effort clears LangGraph checkpoints."""
+    events, and best-effort clears LangGraph checkpoints.
+
+    WHY async: Task.cancel is not thread-safe - only the loop's own thread
+    may call it. Everything blocking is offloaded via to_thread.
+    """
     task = _running_tasks.pop(thread_id, None)
     if task is not None and not task.done():
         task.cancel()
-    destroy_sandbox(thread_id)
-
-    pool = get_pool()
-    with pool.connection() as conn:
-        row = conn.execute("SELECT id FROM threads WHERE id = %s", (thread_id,)).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-
-    # WHY separate connection: a failed statement aborts a postgres
-    # transaction, so best-effort cleanup gets its own connection.
+    # WHY to_thread: destroy_sandbox kills via the E2B API - blocking
+    # network I/O that must never sit on the event loop.
+    await asyncio.to_thread(destroy_sandbox, thread_id)
     try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
-            conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
-            conn.commit()
-    except Exception:
-        pass  # checkpoint schema varies by version - non-fatal
-
-    with pool.connection() as conn:
-        conn.execute("DELETE FROM threads WHERE id = %s", (thread_id,))  # events cascade
-        conn.commit()
+        await asyncio.to_thread(_delete_thread_rows, thread_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Thread not found")
     return {"status": "deleted"}

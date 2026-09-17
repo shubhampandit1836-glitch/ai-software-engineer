@@ -57,6 +57,11 @@ def _build_groq_fast() -> BaseChatModel:
         api_key=_groq_key(),
         temperature=0.1,
         max_tokens=500,
+        # WHY: SDK default request timeout is 600s - a hung connection
+        # during a network blip stalls a run for 10+ minutes (observed:
+        # elapsed=1344s during a DNS outage). 30s is ~10x observed
+        # fast-tier response time.
+        timeout=30,
     )
 
 
@@ -66,6 +71,9 @@ def _build_groq_smart() -> BaseChatModel:
         api_key=_groq_key(),
         temperature=0.2,
         max_tokens=950,
+        # WHY: smart calls (coder/reviewer) legitimately take longer than
+        # fast ones - 90s headroom, still 6x below the SDK default.
+        timeout=90,
     )
 
 
@@ -76,6 +84,7 @@ def _build_openrouter_fast() -> BaseChatModel:
         base_url=OPENROUTER_BASE_URL,
         temperature=0.1,
         max_tokens=500,
+        timeout=30,
     )
 
 
@@ -86,6 +95,7 @@ def _build_openrouter_smart() -> BaseChatModel:
         base_url=OPENROUTER_BASE_URL,
         temperature=0.2,
         max_tokens=950,
+        timeout=90,
     )
 
 
@@ -96,6 +106,7 @@ def _build_nvidia_fast() -> BaseChatModel:
         base_url=NVIDIA_BASE_URL,
         temperature=0.1,
         max_tokens=500,
+        timeout=30,
     )
 
 
@@ -106,6 +117,7 @@ def _build_nvidia_smart() -> BaseChatModel:
         base_url=NVIDIA_BASE_URL,
         temperature=0.2,
         max_tokens=950,
+        timeout=90,
     )
 
 
