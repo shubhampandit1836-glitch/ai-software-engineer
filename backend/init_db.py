@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS thread_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (thread_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT 'default',
+    content TEXT NOT NULL,
+    source_thread_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id);
 """
 
 

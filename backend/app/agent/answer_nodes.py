@@ -1,23 +1,45 @@
+import asyncio
 from typing import Any, Dict
+
 from langchain_core.messages import SystemMessage, HumanMessage
-from app.core.llm import llm_fast, invoke_with_retry
+
+from app.core.llm import invoke_with_retry
 from app.agent.state import AgentState
+from app.core.memory import build_memory_block, get_memories
 
 # WHY: One shared identity block. If the direct answer and the synthesizer
 # describe the agent differently, users notice and trust drops.
 
 AGENT_IDENTITY = """You are "AI Software Engineer" — an autonomous coding agent.
 Your capabilities:
-- You plan, write, test, and debug SMALL Python programs (algorithms, utilities, scripts)
+- You plan, write, test, and debug Python programs (utilities, scripts, and
+  small multi-file projects like FastAPI APIs with tests)
 - You execute every program in a secure cloud sandbox and verify the output yourself
 - You automatically fix your own code when tests fail (up to 3 attempts)
+- You remember facts about the user (name, preferences) across conversations
 
-You CANNOT (yet): build multi-file applications, work in other programming
-languages, access the internet, or perform dangerous system operations."""
+You CANNOT (yet): work in other programming languages, access the internet,
+or perform dangerous system operations."""
+
 
 async def direct_answer_node(state: AgentState) -> Dict[str, Any]:
     """Answers general questions directly — no code, no sandbox. Fast and cheap."""
     task = state["task_description"]
+
+    # WHY to_thread + try/except: memory is an ENHANCEMENT, never a
+    # dependency - a DB hiccup must not take down answering.
+    try:
+        memories = await asyncio.to_thread(get_memories)
+    except Exception:
+        memories = []
+    memory_section = build_memory_block(memories)
+    memory_prompt = (
+        f"\n{memory_section}\n"
+        "Use these memories naturally when relevant - e.g. address the user "
+        "by name, respect stated preferences.\n"
+        if memory_section
+        else ""
+    )
 
     system_prompt = f"""{AGENT_IDENTITY}
 
@@ -26,7 +48,8 @@ async def direct_answer_node(state: AgentState) -> Dict[str, Any]:
     If they ask what you can do, describe your capabilities and suggest 2-3 example
     tasks, such as: "program to swap 2 numbers" or "write a function that checks
     if a string is a palindrome".
-    Never write code in this answer."""
+    Never write code in this answer.
+{memory_prompt}"""
 
     messages = [
         SystemMessage(content=system_prompt),
@@ -36,8 +59,9 @@ async def direct_answer_node(state: AgentState) -> Dict[str, Any]:
     content = response.content
     if not isinstance(content, str):
         content = "\n".join(str(item) for item in content)
-        
+
     return {"final_answer": content.strip(), "status": "answered"}
+
 
 async def synthesizer_node(state: AgentState) -> Dict[str, Any]:
     """Composes the final user-facing answer after a successful coding run."""
@@ -84,6 +108,7 @@ it works. Do NOT include any code. Do NOT include the program output."""
     )
 
     return {"final_answer": final_answer, "status": "synthesized"}
+
 
 async def failure_answer_node(state: AgentState) -> Dict[str, Any]:
     """Graceful exit when the agent cannot fix the code after 3 review attempts.

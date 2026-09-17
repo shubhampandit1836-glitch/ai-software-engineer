@@ -1,4 +1,4 @@
-"""Thread + background-run API (v4a.4).
+"""Thread + background-run API (v4a.4 + v4b memory hookup).
 
 Contract: thread_id is THE key everywhere - ContextVar sandbox routing,
 LangGraph checkpoint thread_id, and thread_events storage. One id, four jobs.
@@ -21,6 +21,7 @@ from app.agent import graph as graph_module
 from app.agent.graph import RECURSION_LIMIT
 from app.agent.state import get_initial_state
 from app.core.db import get_pool
+from app.core.memory import extract_and_sync_memories
 from app.tools.sandbox_manager import destroy_sandbox, set_current_thread
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,11 @@ router = APIRouter()
 # In-memory registry of live background tasks (single-process scope line:
 # a server restart loses these; events/results in Postgres survive).
 _running_tasks: Dict[str, asyncio.Task[None]] = {}
+
+# WHY a separate reference set for memory tasks: asyncio only keeps a weak
+# reference to running tasks - an unreferenced task can be garbage-collected
+# mid-flight. The done-callback discards the reference on completion.
+_memory_tasks: set[asyncio.Task[None]] = set()
 
 
 class RunRequest(BaseModel):
@@ -113,7 +119,12 @@ def _record_user_message(thread_id: str, task: str) -> None:
 
 
 def _delete_thread_rows(thread_id: str) -> None:
-    """All sync DB deletion for delete_thread (same WHY as above)."""
+    """All sync DB deletion for delete_thread (same WHY as above).
+
+    NOTE (v4b): memories are intentionally NOT deleted - they are
+    cross-thread by design; deleting a thread never erases what the
+    agent learned about the user.
+    """
     pool = get_pool()
     with pool.connection() as conn:
         row = conn.execute(
@@ -163,20 +174,16 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
     # freeze every concurrent request mid-poll.
     seq = await asyncio.to_thread(_next_seq, get_pool(), thread_id)
     initial_state = get_initial_state(task)
+    last_answer = ""
     _mark("engine ready, graph starting")
 
     try:
         # WHY graph_module: the stateful graph only exists after lifespan
         # startup - module attribute access reads the live value.
-        # WHY stream_mode="updates" ONLY: v4a.3 also streamed "messages"
-        # and persisted ONE EVENT PER TOKEN - a 344-char answer meant ~80
-        # sequential DB inserts, and the final answer event queued behind
-        # all of them (confirmed live: 81 of 86 events in a 'hi' thread
-        # were tokens; every LLM call ran in 2-3s but the UI waited
-        # 15-20s). The complete answer already arrives in the node update
-        # event's final_answer field - what the UI renders - so token
-        # events added pure latency. Live typing animation, when built,
-        # belongs on a dedicated SSE endpoint, not in the events table.
+        # WHY stream_mode="updates" ONLY: per-token events (v4a.3) meant a
+        # 344-char answer = ~80 sequential inserts with the final answer
+        # queued behind them (the 15-20s 'hi'). The complete answer already
+        # arrives in the node update's final_answer field.
         async for payload in graph_module.agent_graph_stateful.astream(  # type: ignore[union-attr]
             initial_state,
             stream_mode="updates",
@@ -188,6 +195,9 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
             for node_name, node_output in payload.items():
                 if not isinstance(node_output, dict):
                     continue
+                final_answer = node_output.get("final_answer")
+                if final_answer:
+                    last_answer = final_answer
                 event = {
                     "node": node_name,
                     "status": node_output.get("status"),
@@ -199,7 +209,7 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
                     "execution_error": node_output.get("execution_error"),
                     "security_violation": node_output.get("security_violation"),
                     "review_attempts": node_output.get("review_attempts"),
-                    "final_answer": node_output.get("final_answer"),
+                    "final_answer": final_answer,
                 }
                 await asyncio.to_thread(_persist_event, thread_id, seq, event)
                 _mark(f"persisted node={node_name} seq={seq}")
@@ -210,6 +220,17 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
             _persist_event, thread_id, seq, {"node": "end", "status": "completed"}
         )
         _mark("completed")
+
+        # v4b: memory extraction - detached so it adds ZERO user-perceived
+        # latency (the run is complete the moment 'end' persists; this task
+        # continues in the background). extract_and_sync_memories never
+        # raises internally, and the reference set keeps it GC-safe.
+        if last_answer:
+            mem_task = asyncio.create_task(
+                extract_and_sync_memories(task, last_answer, thread_id)
+            )
+            _memory_tasks.add(mem_task)
+            mem_task.add_done_callback(_memory_tasks.discard)
 
     except Exception as e:
         # Even a crashed run must produce an end marker - otherwise the
