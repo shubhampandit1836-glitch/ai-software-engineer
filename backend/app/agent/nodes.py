@@ -1,8 +1,11 @@
+import re
 from typing import Any, Dict
+
 from langchain_core.messages import SystemMessage, HumanMessage
-from app.core.llm import llm_smart, invoke_with_retry
+
+from app.core.llm import invoke_with_retry
 from app.agent.state import AgentState
-from app.tools.file_tools import write_file, read_file, list_files, run_command
+from app.tools.file_tools import write_file, run_command
 
 # WHY: Hard caps are code, not prompts. The prompt ASKS for few steps,
 # but this constant GUARANTEES the cap even if the model disobeys.
@@ -20,13 +23,24 @@ def _to_text(content: Any) -> str:
     return "\n".join(str(item) for item in content)
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_OPEN_RE = re.compile(r"<think>.*$", re.DOTALL)
+
+
 def _clean(text: str) -> str:
-    """Strips reasoning-model <think> blocks so they never leak into output."""
-    while "<think>" in text and "</think>" in text:
-        start = text.find("<think>")
-        end = text.find("</think>") + len("</think>")
-        text = text[:start] + text[end:]
+    """Strips reasoning-model <think> blocks so they never leak into output.
+
+    WHY two regexes, not the old paired-tag loop: qwen3/gpt-oss emit their
+    deliberation inside <think> tags. Paired blocks are removed wholesale.
+    An UNCLOSED <think> (the model ran out of tokens mid-thought at our
+    950-token cap) means EVERYTHING after it is reasoning too - including
+    any FILE blocks - so it is all removed. The old loop only handled the
+    paired case, so truncation let half-finished deliberation through.
+    """
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = _THINK_OPEN_RE.sub("", text)
     return text.strip()
+
 
 def _strip_tool_calls(text: str) -> str:
     """Removes <tool_call>...</tool_call> blocks some models emit when
@@ -36,6 +50,7 @@ def _strip_tool_calls(text: str) -> str:
         end = text.find("</tool_call>") + len("</tool_call>")
         text = text[:start] + text[end:]
     return text
+
 
 def _extract_code(content: str) -> str:
     """Pulls pure Python out of a (possibly markdown-wrapped) LLM response."""
@@ -71,6 +86,7 @@ def _render_repo(files: Dict[str, str]) -> str:
         parts.append(f"--- {path} ---\n{content}")
     return "\n\n".join(parts)
 
+
 def _strip_wrapping_fences(lines: list[str]) -> list[str]:
     """Removes markdown fences the LLM wraps around file CONTENT.
 
@@ -88,6 +104,42 @@ def _strip_wrapping_fences(lines: list[str]) -> list[str]:
     return lines
 
 
+# WHY line-START markers instead of substring search: prose like "capture
+# ids from responses" contains "from " as a substring, but real Python
+# files essentially always have at least one line that BEGINS with a
+# statement. Applied ONLY on malformed/guarded parse paths - properly
+# closed FILE blocks are always trusted.
+_CODE_LINE_STARTS = (
+    "import ", "from ", "def ", "class ", "async ", "if ", "for ",
+    "while ", "try:", "with ", "return ", "print(", "@", "#", FENCE,
+)
+
+# WHY: keyword starts alone are not enough - a truncated file can contain
+# nothing but plain assignments ("x = 1\ny = 2", locked in by the unit
+# test test_parse_salvages_unterminated_file). Prose lines ("Let me
+# analyze the current state.") match neither pattern: their first word is
+# followed by more words, never an operator or parenthesis.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\s*(=|\+=|-=|\*=|/=)")
+_CALL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\(")
+
+
+def _looks_like_code(text: str) -> bool:
+    """Guard for malformed parse paths: True when at least one line looks
+    like a Python statement (keyword start, assignment, or call). Stops
+    leaked model reasoning (prose) from being shipped as a file - observed
+    live when the todo run's root main.py turned out to be the coder's
+    deliberation."""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(_CODE_LINE_STARTS):
+            return True
+        if _ASSIGNMENT_RE.match(stripped) or _CALL_RE.match(stripped):
+            return True
+    return False
+
+
 def _parse_file_operations(raw: str) -> Dict[str, str]:
     """Parses the coder's FILE:-delimited output into {path: content}.
 
@@ -98,31 +150,40 @@ def _parse_file_operations(raw: str) -> Dict[str, str]:
         FILE: path/to/file.py
         (content lines...)
         ENDFILE
+
+    GUARDED SAVES: a block that never reaches its ENDFILE (model ran out
+    of tokens, or the block is actually leaked reasoning) is kept only if
+    its content looks like code. Properly closed blocks are always kept.
     """
     files: Dict[str, str] = {}
     current_path = None
     buffer: list[str] = []
 
+    def _commit(path: str, lines: list[str], guarded: bool) -> None:
+        content = "\n".join(_strip_wrapping_fences(lines)).strip()
+        if guarded and not _looks_like_code(content):
+            # WHY: an unterminated block is exactly how an all-reasoning
+            # response smuggles prose in as a file (the todo main.py bug).
+            return
+        files[path] = content + "\n" if content else ""
+
     for line in raw.split("\n"):
         stripped = line.strip()
         if stripped.startswith("FILE:"):
             if current_path is not None:
-                content_lines = _strip_wrapping_fences(buffer)
-                files[current_path] = "\n".join(content_lines).strip()
+                _commit(current_path, buffer, guarded=True)
             current_path = stripped[5:].strip()
             buffer = []
         elif stripped == "ENDFILE":
             if current_path is not None:
-                content_lines = _strip_wrapping_fences(buffer)
-                files[current_path] = "\n".join(content_lines).rstrip() + "\n"
+                _commit(current_path, buffer, guarded=False)
                 current_path = None
                 buffer = []
         elif current_path is not None:
             buffer.append(line)
 
     if current_path is not None:
-        content_lines = _strip_wrapping_fences(buffer)
-        files[current_path] = "\n".join(content_lines).strip()
+        _commit(current_path, buffer, guarded=True)
 
     return files
 
@@ -220,15 +281,17 @@ FILE: path/name.py
 ENDFILE
 3. Repeat the FILE/ENDFILE block for each file in this step.
 4. NEVER output diffs or fragments - always the complete file.
-5. All source files must be importable modules. For web frameworks
+5. FILE blocks contain ONLY the literal file contents - never
+   explanations, narration, or reasoning inside them.
+6. All source files must be importable modules. For web frameworks
    (FastAPI/Flask), do NOT include uvicorn.run or any server-startup
    code - tests use TestClient, which needs no running server, and a
    blocking server start would hang the sandbox.
-6. Test files go in tests/ and use pytest (functions named test_*).
+7. Test files go in tests/ and use pytest (functions named test_*).
    Tests MUST be independent: never rely on state from other tests - reset
    shared globals in a fixture, and capture ids from responses instead of
    hardcoding them.
-7. Stay under 80 lines per file.
+8. Stay under 80 lines per file.
 
 Output the FILE blocks now."""
 
@@ -246,7 +309,11 @@ Output the FILE blocks now."""
     # to single-file mode instead of dying.
     if not new_files:
         code = _extract_code(raw)
-        if code:
+        # WHY the code guard: when the model spends its entire output
+        # budget on reasoning and emits NO FILE blocks, _extract_code
+        # returns that prose whole - which used to be shipped as main.py
+        # (observed: the todo run's root main.py was model deliberation).
+        if code and _looks_like_code(code):
             new_files = {"main.py": code}
 
     # Materialize into the sandbox now (writes are scanner-gated inside
@@ -428,7 +495,8 @@ RULES:
    Check for these common culprits: state leaking between tests (globals
    not reset by fixtures), tests hardcoding ids instead of using returned
    values, wrong status codes, missing imports.
-1. Output corrected files in this exact format, COMPLETE (no diffs):
+1. Output corrected files in this exact format, COMPLETE (no diffs) and
+   containing ONLY the literal file contents - no narration or reasoning:
 FILE: path/name.py
 <complete corrected file contents>
 ENDFILE

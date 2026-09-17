@@ -1,6 +1,9 @@
 import os
 import asyncio
+import logging
+import time
 from typing import Optional, Sequence
+
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
@@ -11,6 +14,8 @@ from pydantic import SecretStr
 # WHY: This module is the FIRST thing loaded. The .env keys must enter
 # os.environ BEFORE the tier construction below runs at import time.
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ---------- Provider tier definitions ----------
 # WHY a tier is a ROLE, not a provider: "smart" means the coding brain,
@@ -106,10 +111,14 @@ def _build_nvidia_smart() -> BaseChatModel:
 
 # WHY: skip providers whose key is absent - a missing OPENROUTER_API_KEY
 # must degrade the chain gracefully (Groq -> NVIDIA), never crash it.
+# WHY nvidia BEFORE openrouter in the fast tier: free OpenRouter queues
+# routinely add 10-30s; NVIDIA NIM's free tier answers fast. The fast tier
+# is the greeting/classifier path - latency is its whole job. The smart
+# tier keeps the milestone-proven order.
 FAST_PROVIDERS = [
     ("groq", _build_groq_fast),
-    ("openrouter", _build_openrouter_fast),
     ("nvidia", _build_nvidia_fast),
+    ("openrouter", _build_openrouter_fast),
 ]
 
 SMART_PROVIDERS = [
@@ -119,15 +128,27 @@ SMART_PROVIDERS = [
 ]
 
 # ---------- Back-compat handles ----------
-# WHY: nodes.py and answer_nodes.py import llm_fast / llm_smart directly.
-# Keeping these names means v3.5 changes ZERO call sites - the failover
-# lives entirely inside invoke_with_retry.
+# WHY: answer_nodes.py imports llm_fast / llm_smart directly. Keeping these
+# names means v3.5 changes ZERO call sites - the failover lives entirely
+# inside invoke_with_retry.
 llm_fast = _build_groq_fast()
 llm_smart = _build_groq_smart()
 
 MAX_ATTEMPTS_PER_PROVIDER = 3
 RATE_LIMIT_WAIT_SECONDS = 20
 TRANSIENT_WAIT_SECONDS = 2
+# WHY one held retry per provider on 429: waiting twice (2 x 20s) keeps a
+# run stuck 40s+ on a provider whose per-minute quota is already dead;
+# after one held retry fails, rotating is strictly better.
+MAX_RATE_LIMIT_RETRIES_PER_PROVIDER = 1
+
+# WHY module-level: maps provider name -> its env var, both for the
+# availability check and as documentation of every supported provider.
+_KEY_ENV = {
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+}
 
 
 def _is_rate_limit(exc: Exception) -> bool:
@@ -154,25 +175,40 @@ def _is_provider_error(exc: Exception) -> bool:
     return any(marker in text for marker in provider_markers)
 
 
-async def _try_invoke(llm: BaseChatModel, messages: Sequence[BaseMessage]) -> BaseMessage:
+async def _try_invoke(
+    llm: BaseChatModel,
+    messages: Sequence[BaseMessage],
+    rate_limit_wait: float = RATE_LIMIT_WAIT_SECONDS,
+) -> BaseMessage:
     """Per-provider retry with rate-limit-aware backoff.
 
-    WHY 20s on rate limits: OTPM budgets refill per MINUTE, so waiting
-    preserves the strong primary provider. The flat 2s wait rotated to
-    the fallback model almost instantly - and the weaker model broke the
-    milestone run. The v2 behavior that PASSED the milestone waited 20s;
-    this restores that patience inside the cascade.
+    WHY the rate_limit_wait parameter: OTPM budgets refill per MINUTE, so
+    the SMART tier waits out the window to preserve the strong primary
+    provider (quality over latency). The FAST tier passes 0.0 - a greeting
+    or classification must cascade to the next provider IMMEDIATELY
+    instead of sitting out a window (the 15-20s 'hi' bug). Each provider
+    has its own quota, so the next provider is very likely free.
     """
     last_exc: Optional[Exception] = None
+    rate_limit_retries = 0
     for attempt in range(1, MAX_ATTEMPTS_PER_PROVIDER + 1):
         try:
             return await llm.ainvoke(messages)
         except Exception as e:
             last_exc = e
+            if _is_rate_limit(e):
+                if rate_limit_wait <= 0.0:
+                    # WHY: cascading now beats burning two more instant
+                    # 429s against a provider whose quota is exhausted.
+                    break
+                if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES_PER_PROVIDER:
+                    break
+                rate_limit_retries += 1
+                await asyncio.sleep(rate_limit_wait)
+                continue
             if attempt == MAX_ATTEMPTS_PER_PROVIDER:
                 break
-            wait = RATE_LIMIT_WAIT_SECONDS if _is_rate_limit(e) else TRANSIENT_WAIT_SECONDS
-            await asyncio.sleep(wait)
+            await asyncio.sleep(TRANSIENT_WAIT_SECONDS)
     assert last_exc is not None  # for the type checker: loop always sets it on failure
     raise last_exc
 
@@ -185,30 +221,45 @@ async def invoke_with_retry(
 
     Signature CHANGED from v2: messages first, tier selector second.
     A tier ('fast'|'smart') maps to a provider cascade; failures rotate
-    Groq -> OpenRouter -> NVIDIA without any caller knowing.
+    providers without any caller knowing. Backoff is tier-aware:
+    smart HOLDS the strong provider through a 429 window; fast cascades
+    immediately.
     """
     providers = FAST_PROVIDERS if tier == "fast" else SMART_PROVIDERS
+    rate_limit_wait = 0.0 if tier == "fast" else RATE_LIMIT_WAIT_SECONDS
+    started = time.perf_counter()
 
     errors: list[str] = []
     for name, factory in providers:
         # WHY factory here, not at module import: a provider with no key
         # constructs an unusable client - building lazily lets us check
         # availability per call instead.
-        key_env = {
-            "groq": "GROQ_API_KEY",
-            "openrouter": "OPENROUTER_API_KEY",
-            "nvidia": "NVIDIA_API_KEY",
-        }[name]
-        if not os.environ.get(key_env):
+        if not os.environ.get(_KEY_ENV[name]):
             errors.append(f"{name}: no api key")
             continue
 
         try:
             llm = factory()
-            return await _try_invoke(llm, messages)
+            result = await _try_invoke(llm, messages, rate_limit_wait=rate_limit_wait)
+            # WHY one line per LLM call: every future "why is this slow?"
+            # becomes answerable from the terminal (provider + elapsed).
+            logger.info(
+                "llm ok: tier=%s provider=%s elapsed=%.1fs chars=%d",
+                tier,
+                name,
+                time.perf_counter() - started,
+                len(result.content or ""),
+            )
+            return result
         except Exception as e:
             if _is_provider_error(e):
                 errors.append(f"{name}: {str(e)[:120]}")
+                logger.warning(
+                    "llm provider error: tier=%s provider=%s (%s)",
+                    tier,
+                    name,
+                    str(e)[:200],
+                )
                 continue  # rotate to next provider
             # Request-level error: same fate everywhere - raise now.
             raise

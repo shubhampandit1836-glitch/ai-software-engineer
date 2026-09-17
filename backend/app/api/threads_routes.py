@@ -79,25 +79,23 @@ async def _run_agent_background(thread_id: str, task: str) -> None:
     try:
         # WHY graph_module: the stateful graph only exists after lifespan
         # startup - module attribute access reads the live value.
-        async for mode, payload in graph_module.agent_graph_stateful.astream(  # type: ignore[union-attr]
+        # WHY stream_mode="updates" ONLY: v4a.3 also streamed "messages"
+        # and persisted ONE EVENT PER TOKEN - a 344-char answer meant ~80
+        # sequential DB inserts, and the final answer event queued behind
+        # all of them (confirmed live: 81 of 86 events in a 'hi' thread
+        # were tokens; every LLM call ran in 2-3s but the UI waited
+        # 15-20s). The complete answer already arrives in the node update
+        # event's final_answer field - what the UI renders - so token
+        # events added pure latency. Live typing animation, when built,
+        # belongs on a dedicated SSE endpoint, not in the events table.
+        async for payload in graph_module.agent_graph_stateful.astream(  # type: ignore[union-attr]
             initial_state,
-            stream_mode=["updates", "messages"],
+            stream_mode="updates",
             config={
                 "recursion_limit": RECURSION_LIMIT,
                 "configurable": {"thread_id": thread_id},
             },
         ):
-            if mode == "messages":
-                chunk, meta = payload
-                node = meta.get("langgraph_node", "")
-                if node in ("direct_answer", "synthesizer"):
-                    content = chunk.content
-                    if isinstance(content, str) and content:
-                        event = {"node": node, "type": "token", "content": content}
-                        await asyncio.to_thread(_persist_event, thread_id, seq, event)
-                        seq += 1
-                continue
-
             for node_name, node_output in payload.items():
                 if not isinstance(node_output, dict):
                     continue

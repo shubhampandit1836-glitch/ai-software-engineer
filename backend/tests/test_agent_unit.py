@@ -165,6 +165,18 @@ def test_parse_salvages_unterminated_file():
     assert "main.py" in result
     assert "x = 1" in result["main.py"]
 
+def test_parse_drops_prose_unterminated_file():
+    # WHY: leaked model deliberation masquerading as an unterminated FILE
+    # block must NOT be shipped as a file (the todo run's junk main.py bug)
+    raw = (
+        "FILE: main.py\n"
+        "Let me analyze the current state. The test suite is already\n"
+        "written in tests, with a fixture in conftest.py. Let me trace\n"
+        "through the code for correctness before outputting anything."
+    )
+    result = _parse_file_operations(raw)
+    assert "main.py" not in result
+
 def test_parse_ignores_preamble():
     raw = "Here are the files:\nFILE: a.py\nz = 3\nENDFILE"
     assert _parse_file_operations(raw) == {"a.py": "z = 3\n"}
